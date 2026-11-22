@@ -1,0 +1,20 @@
+// SLO trend: the windows SLI per 5-minute bin, with the objective drawn as a line.
+let objective_pct = 99.0; // TODO(team): keep in sync with slo-windows.kql
+let target_ms = 1000.0;
+// Request log lines written by both services (app/logging_setup.py), one JSON object per line.
+// Works with both table names Container Apps uses (classic *_CL and the newer one).
+let Requests = union isfuzzy=true
+    (ContainerAppConsoleLogs_CL | project TimeGenerated, App = ContainerAppName_s, Line = Log_s),
+    (ContainerAppConsoleLogs | project TimeGenerated, App = ContainerAppName, Line = Log)
+| where Line startswith "{"
+| extend j = parse_json(Line)
+| where tostring(j.msg) == "request"
+| extend service = tostring(j.service), method = tostring(j.method), route = tostring(j.route),
+         status = toint(j.status), duration_ms = todouble(j.duration_ms);
+Requests
+| where TimeGenerated > ago(24h)
+| where service == "api" and method == "GET" and route == "/passages/{passage_id}/windows"
+| summarize sli_pct = round(100.0 * countif(status < 500 and duration_ms < target_ms) / count(), 2)
+    by bin(TimeGenerated, 5m)
+| extend objective_pct = objective_pct
+| render timechart

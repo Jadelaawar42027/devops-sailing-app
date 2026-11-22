@@ -1,0 +1,988 @@
+diff -ruN 03-forecast/docker-compose.yml 04-scoring/docker-compose.yml
+--- 03-forecast/docker-compose.yml	2026-11-22 20:15:58
++++ 04-scoring/docker-compose.yml	2026-11-22 20:18:37
+@@ -37,6 +37,7 @@
+     environment:
+       <<: *db-env
+       DB_NAME: api
++      FORECAST_URL: http://forecast:8000
+       CORS_ORIGINS: http://localhost:8090
+       LOG_LEVEL: INFO
+     depends_on:
+diff -ruN 03-forecast/services/api/app/config.py 04-scoring/services/api/app/config.py
+--- 03-forecast/services/api/app/config.py	2026-11-22 20:11:17
++++ 04-scoring/services/api/app/config.py	2026-11-22 20:17:21
+@@ -30,6 +30,9 @@
+     db_connect_retries: int = 20
+     db_retry_delay_s: float = 5.0
+     run_migrations: bool = True
++    forecast_url: str = "http://localhost:8011"
++    forecast_timeout_s: float = 10.0
++    forecast_days: int = 3
+ 
+ 
+ def database_url_from_env() -> str | URL:
+@@ -64,4 +67,7 @@
+         db_create_if_missing=_bool(os.getenv("DB_CREATE_IF_MISSING")),
+         db_connect_retries=int(os.getenv("DB_CONNECT_RETRIES", "20")),
+         db_retry_delay_s=float(os.getenv("DB_RETRY_DELAY_S", "5")),
++        forecast_url=os.getenv("FORECAST_URL", "http://localhost:8011"),
++        forecast_timeout_s=float(os.getenv("FORECAST_TIMEOUT_S", "10")),
++        forecast_days=int(os.getenv("FORECAST_DAYS", "3")),
+     )
+diff -ruN 03-forecast/services/api/app/forecast_client.py 04-scoring/services/api/app/forecast_client.py
+--- 03-forecast/services/api/app/forecast_client.py	1970-01-01 01:00:00
++++ 04-scoring/services/api/app/forecast_client.py	2026-11-22 20:17:21
+@@ -0,0 +1,77 @@
++"""HTTP client for the forecast service, with a hard timeout and clear error messages."""
++
++import logging
++import time
++from datetime import datetime
++
++import httpx
++
++from app.scoring import HourConditions
++
++log = logging.getLogger("upstream")
++
++
++class ForecastServiceError(Exception):
++    """The forecast service is down, slow, or could not get a forecast."""
++
++
++class ForecastClient:
++    def __init__(self, http: httpx.Client, base_url: str, timeout_s: float) -> None:
++        self.http = http
++        self.base_url = base_url.rstrip("/")
++        self.timeout_s = timeout_s
++
++    def hourly(self, lat: float, lon: float, days: int) -> tuple[list[HourConditions], bool]:
++        """Return (hours, stale)."""
++        start = time.perf_counter()
++        status = None
++        try:
++            response = self.http.get(
++                f"{self.base_url}/forecast",
++                params={"lat": lat, "lon": lon, "days": days},
++                timeout=self.timeout_s,
++            )
++            status = response.status_code
++            if response.status_code != 200:
++                raise ForecastServiceError(_detail(response))
++            body = response.json()
++            hours = [_hour(h) for h in body["hours"]]
++            return hours, bool(body.get("stale"))
++        except httpx.TimeoutException as exc:
++            raise ForecastServiceError(
++                f"forecast service did not answer within {self.timeout_s:g}s"
++            ) from exc
++        except httpx.HTTPError as exc:
++            raise ForecastServiceError(
++                f"forecast service is unreachable ({type(exc).__name__})"
++            ) from exc
++        except (KeyError, TypeError, ValueError) as exc:
++            raise ForecastServiceError("forecast service sent an unexpected response") from exc
++        finally:
++            log.info(
++                "upstream call",
++                extra={
++                    "fields": {
++                        "upstream": "forecast-service",
++                        "status": status,
++                        "duration_ms": round((time.perf_counter() - start) * 1000, 1),
++                    }
++                },
++            )
++
++
++def _detail(response: httpx.Response) -> str:
++    try:
++        detail = response.json().get("detail")
++    except ValueError:
++        detail = None
++    return detail or f"forecast service answered HTTP {response.status_code}"
++
++
++def _hour(h: dict) -> HourConditions:
++    return HourConditions(
++        time=datetime.fromisoformat(h["time"].replace("Z", "+00:00")),
++        wind_kn=h.get("wind_kn"),
++        gust_kn=h.get("gust_kn"),
++        wave_m=h.get("wave_m"),
++    )
+diff -ruN 03-forecast/services/api/app/geo.py 04-scoring/services/api/app/geo.py
+--- 03-forecast/services/api/app/geo.py	1970-01-01 01:00:00
++++ 04-scoring/services/api/app/geo.py	2026-11-22 20:17:00
+@@ -0,0 +1,13 @@
++"""Small, pure geometry helpers."""
++
++from math import asin, cos, radians, sin, sqrt
++
++EARTH_RADIUS_NM = 3440.065
++
++
++def distance_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
++    """Great-circle (haversine) distance in nautical miles."""
++    p1, p2 = radians(lat1), radians(lat2)
++    dlat, dlon = p2 - p1, radians(lon2 - lon1)
++    a = sin(dlat / 2) ** 2 + cos(p1) * cos(p2) * sin(dlon / 2) ** 2
++    return 2 * EARTH_RADIUS_NM * asin(min(1.0, sqrt(a)))
+diff -ruN 03-forecast/services/api/app/main.py 04-scoring/services/api/app/main.py
+--- 03-forecast/services/api/app/main.py	2026-11-22 20:11:17
++++ 04-scoring/services/api/app/main.py	2026-11-22 20:17:21
+@@ -3,6 +3,7 @@
+ import logging
+ from contextlib import asynccontextmanager
+ 
++import httpx
+ from fastapi import FastAPI, Request
+ from fastapi.middleware.cors import CORSMiddleware
+ from fastapi.responses import JSONResponse
+@@ -12,12 +13,12 @@
+ from app.config import Settings, load_settings
+ from app.db import make_engine, prepare_database
+ from app.logging_setup import add_request_logging, configure_logging
+-from app.routers import boats, health, passages
++from app.routers import boats, health, passages, windows
+ 
+ log = logging.getLogger(__name__)
+ 
+ 
+-def create_app(settings: Settings | None = None) -> FastAPI:
++def create_app(settings: Settings | None = None, http: httpx.Client | None = None) -> FastAPI:
+     settings = settings or load_settings()
+     configure_logging(settings.service_name, settings.log_level)
+     engine = make_engine(settings.database_url)
+@@ -27,12 +28,14 @@
+         if settings.run_migrations:
+             prepare_database(settings, engine)
+         yield
++        app.state.http.close()
+         engine.dispose()
+ 
+     app = FastAPI(title="Sailing Planner API", version=settings.version, lifespan=lifespan)
+     app.state.settings = settings
+     app.state.engine = engine
+     app.state.session_factory = sessionmaker(bind=engine, expire_on_commit=False)
++    app.state.http = http or httpx.Client(headers={"User-Agent": "sailing-planner-api/1.0"})
+ 
+     # CORS restricted to the UI origin (brief §3a).
+     app.add_middleware(
+@@ -54,4 +57,5 @@
+     app.include_router(health.router)
+     app.include_router(boats.router)
+     app.include_router(passages.router)
++    app.include_router(windows.router)
+     return app
+diff -ruN 03-forecast/services/api/app/routers/windows.py 04-scoring/services/api/app/routers/windows.py
+--- 03-forecast/services/api/app/routers/windows.py	1970-01-01 01:00:00
++++ 04-scoring/services/api/app/routers/windows.py	2026-11-22 20:19:19
+@@ -0,0 +1,80 @@
++"""GET /passages/{id}/windows: hourly departure windows, each GO or NO-GO with a reason."""
++
++from dataclasses import asdict
++from datetime import UTC, datetime
++
++from fastapi import APIRouter, Request
++from fastapi.responses import JSONResponse
++
++from app.db import SessionDep
++from app.forecast_client import ForecastClient, ForecastServiceError
++from app.geo import distance_nm
++from app.models import Boat
++from app.routers.passages import get_passage_or_404
++from app.scoring import Limits, passage_duration_h, score_windows, worst_of
++
++router = APIRouter(tags=["windows"])
++
++
++def utcnow() -> datetime:
++    """Separate function so tests can freeze the clock."""
++    return datetime.now(UTC)
++
++
++@router.get("/passages/{passage_id}/windows")
++def passage_windows(passage_id: int, request: Request, session: SessionDep):
++    settings = request.app.state.settings
++    passage = get_passage_or_404(session, passage_id)
++    boat = session.get(Boat, passage.boat_id)
++    limits = Limits(boat.max_wind_kn, boat.max_wave_m, boat.max_gust_kn)
++
++    distance = distance_nm(passage.start_lat, passage.start_lon, passage.end_lat, passage.end_lon)
++    duration = passage_duration_h(distance, passage.speed_kn)
++
++    points = {(round(passage.start_lat, 2), round(passage.start_lon, 2))}
++    points.add((round(passage.end_lat, 2), round(passage.end_lon, 2)))
++    client = ForecastClient(
++        request.app.state.http, settings.forecast_url, settings.forecast_timeout_s
++    )
++    try:
++        fetched = [client.hourly(lat, lon, settings.forecast_days) for lat, lon in sorted(points)]
++    except ForecastServiceError as exc:
++        # Partial failure (brief §6): CRUD keeps working; this flow fails fast and clearly.
++        return JSONResponse(
++            status_code=503,
++            content={
++                "status": "degraded",
++                "detail": f"Forecast unavailable: {exc}. Boats and passages still work; "
++                "try the windows again in a minute.",
++                "passage_id": passage_id,
++                "windows": [],
++            },
++        )
++
++    hours = worst_of(*(series for series, _ in fetched))
++    this_hour = utcnow().replace(minute=0, second=0, microsecond=0)
++    windows = score_windows(limits, hours, duration, not_before=this_hour)
++    go = [w for w in windows if w.go]
++    return {
++        "status": "ok",
++        "passage_id": passage.id,
++        "boat_id": boat.id,
++        "distance_nm": round(distance, 1),
++        "duration_h": round(duration, 1),
++        "speed_kn": passage.speed_kn,
++        "limits": asdict(limits),
++        "forecast": {
++            "source": "open-meteo",
++            "points": len(points),
++            "horizon_hours": len(hours),
++            "stale": any(stale for _, stale in fetched),
++        },
++        "summary": {
++            "windows": len(windows),
++            "go": len(go),
++            "no_go": len(windows) - len(go),
++            "first_go": go[0].departure if go else None,
++            "note": None if windows else "Passage is longer than the forecast horizon.",
++        },
++        "windows": [asdict(w) for w in windows],
++    }
+diff -ruN 03-forecast/services/api/app/scoring.py 04-scoring/services/api/app/scoring.py
+--- 03-forecast/services/api/app/scoring.py	1970-01-01 01:00:00
++++ 04-scoring/services/api/app/scoring.py	2026-11-22 20:19:36
+@@ -0,0 +1,177 @@
++"""GO / NO-GO scoring for departure windows (R3). Pure functions: no I/O, no clock.
++
++A departure at hour H is GO when every forecast hour from H up to the first hour at or
++after arrival is within the boat's limits at every sampled point (start and end of the
++passage, worst value wins). Otherwise it is NO-GO, with the limit that failed and by how much.
++"""
++
++from dataclasses import dataclass, field
++from datetime import datetime, timedelta
++from math import ceil
++
++# TODO(team): decide the safety margin. 0.0 = NO-GO only when a value is strictly above the
++# boat's limit (exactly at the limit is GO). 0.1 would turn NO-GO above 90% of each limit.
++SAFETY_MARGIN = 0.0
++
++VARIABLES = (
++    # (key in HourConditions, key in Limits, label, unit, decimals)
++    ("wind_kn", "max_wind_kn", "Wind", "kn", 1),
++    ("gust_kn", "max_gust_kn", "Gusts", "kn", 1),
++    ("wave_m", "max_wave_m", "Waves", "m", 2),
++)
++
++
++@dataclass(frozen=True)
++class Limits:
++    max_wind_kn: float
++    max_wave_m: float
++    max_gust_kn: float | None = None  # None = gusts not checked
++
++
++@dataclass(frozen=True)
++class HourConditions:
++    time: datetime
++    wind_kn: float | None
++    gust_kn: float | None
++    wave_m: float | None
++
++
++@dataclass(frozen=True)
++class Failure:
++    limit: str  # "wind" | "gusts" | "waves" | "missing_data"
++    observed: float | None
++    limit_value: float | None
++    exceeded_by: float | None
++    at: datetime
++    message: str
++
++
++@dataclass(frozen=True)
++class Window:
++    departure: datetime
++    arrival: datetime
++    go: bool
++    reason: str
++    failures: list[Failure] = field(default_factory=list)
++    peak: dict[str, float | None] = field(default_factory=dict)
++
++
++def passage_duration_h(distance_nm: float, speed_kn: float) -> float:
++    if speed_kn <= 0:
++        raise ValueError("speed_kn must be positive")
++    return distance_nm / speed_kn
++
++
++def worst_of(*series: list[HourConditions]) -> list[HourConditions]:
++    """Combine several points' hourly series: per hour, the highest value of each variable.
++
++    Hours missing from any series are dropped. A value missing at one point is ignored if
++    another point has it; it stays None only when no point has it.
++    """
++    if not series:
++        return []
++    by_time = [{h.time: h for h in s} for s in series]
++    common = sorted(set(by_time[0]).intersection(*by_time[1:]))
++    combined = []
++    for t in common:
++        hours = [m[t] for m in by_time]
++        combined.append(
++            HourConditions(
++                time=t,
++                wind_kn=_max(h.wind_kn for h in hours),
++                gust_kn=_max(h.gust_kn for h in hours),
++                wave_m=_max(h.wave_m for h in hours),
++            )
++        )
++    return combined
++
++
++def score_windows(
++    limits: Limits,
++    hours: list[HourConditions],
++    duration_h: float,
++    not_before: datetime | None = None,
++) -> list[Window]:
++    """One Window per hourly departure whose whole passage fits inside the forecast.
++
++    not_before drops departures in the past (the caller passes "now"; this stays pure).
++    """
++    if duration_h < 0:
++        raise ValueError("duration_h must not be negative")
++    steps = ceil(duration_h)  # forecast hours after departure that the passage touches
++    windows = []
++    for i in range(len(hours) - steps):
++        span = hours[i : i + steps + 1]
++        departure = span[0].time
++        if not_before is not None and departure < not_before:
++            continue
++        windows.append(_score(limits, span, departure, departure + timedelta(hours=duration_h)))
++    return windows
++
++
++def _score(
++    limits: Limits, span: list[HourConditions], departure: datetime, arrival: datetime
++) -> Window:
++    failures: list[Failure] = []
++    peak: dict[str, float | None] = {}
++    for attr, limit_attr, label, unit, nd in VARIABLES:
++        limit = getattr(limits, limit_attr)
++        values = [(h.time, getattr(h, attr)) for h in span]
++        known = [(t, v) for t, v in values if v is not None]
++        peak[attr] = round(max(v for _, v in known), nd) if known else None
++        if limit is None:
++            continue
++        missing = [t for t, v in values if v is None]
++        if missing:
++            failures.append(
++                Failure(
++                    "missing_data",
++                    None,
++                    limit,
++                    None,
++                    missing[0],
++                    f"No {label.lower()} forecast at {_hhmm(missing[0])}",
++                )
++            )
++            continue
++        threshold = limit * (1 - SAFETY_MARGIN)
++        t_worst, worst = max(known, key=lambda tv: tv[1])
++        if worst > threshold:
++            over = round(worst - threshold, nd)
++            failures.append(
++                Failure(
++                    label.lower(),
++                    round(worst, nd),
++                    round(threshold, nd),
++                    over,
++                    t_worst,
++                    f"{label} {worst:.{nd}f} {unit} exceeds limit {threshold:.{nd}f} {unit} "
++                    f"by {over:.{nd}f} {unit} at {_hhmm(t_worst)}",
++                )
++            )
++    failures.sort(key=_severity, reverse=True)
++    if failures:
++        reason = "; ".join(f.message for f in failures)
++    else:
++        reason = "Within limits: " + ", ".join(
++            f"max {label.lower()} {peak[attr]:.{nd}f}/{getattr(limits, lim):.{nd}f} {unit}"
++            for attr, lim, label, unit, nd in VARIABLES
++            if getattr(limits, lim) is not None and peak[attr] is not None
++        )
++    return Window(departure, arrival, not failures, reason, failures, peak)
++
++
++def _severity(f: Failure) -> float:
++    """Missing data first, then the largest exceedance relative to its limit."""
++    if f.exceeded_by is None or not f.limit_value:
++        return float("inf")
++    return f.exceeded_by / f.limit_value
++
++
++def _max(values) -> float | None:
++    present = [v for v in values if v is not None]
++    return max(present) if present else None
++
++
++def _hhmm(t: datetime) -> str:
++    return t.strftime("%a %d %b %H:%MZ")
+diff -ruN 03-forecast/services/api/tests/fixtures/forecast_front_passing.json 04-scoring/services/api/tests/fixtures/forecast_front_passing.json
+--- 03-forecast/services/api/tests/fixtures/forecast_front_passing.json	1970-01-01 01:00:00
++++ 04-scoring/services/api/tests/fixtures/forecast_front_passing.json	2026-11-22 20:18:09
+@@ -0,0 +1,227 @@
++{
++ "_comment": "Synthetic 24h forecast for one point: a front peaks at 11:00-12:00Z (30 kn, 3.1 m). Shape matches GET /forecast of the forecast service.",
++ "latitude": 41.38,
++ "longitude": 2.18,
++ "source": "open-meteo",
++ "cache": "hit",
++ "age_s": 0,
++ "stale": false,
++ "hours": [
++  {
++   "time": "2026-11-23T00:00Z",
++   "wind_kn": 8.0,
++   "gust_kn": 11.2,
++   "wind_dir_deg": 270,
++   "wave_m": 0.6,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T01:00Z",
++   "wind_kn": 9.0,
++   "gust_kn": 12.6,
++   "wind_dir_deg": 270,
++   "wave_m": 0.6,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T02:00Z",
++   "wind_kn": 10.0,
++   "gust_kn": 14.0,
++   "wind_dir_deg": 270,
++   "wave_m": 0.7,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T03:00Z",
++   "wind_kn": 11.0,
++   "gust_kn": 15.4,
++   "wind_dir_deg": 270,
++   "wave_m": 0.8,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T04:00Z",
++   "wind_kn": 12.0,
++   "gust_kn": 16.8,
++   "wind_dir_deg": 270,
++   "wave_m": 0.9,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T05:00Z",
++   "wind_kn": 14.0,
++   "gust_kn": 19.6,
++   "wind_dir_deg": 270,
++   "wave_m": 1.0,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T06:00Z",
++   "wind_kn": 16.0,
++   "gust_kn": 22.4,
++   "wind_dir_deg": 270,
++   "wave_m": 1.2,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T07:00Z",
++   "wind_kn": 18.0,
++   "gust_kn": 25.2,
++   "wind_dir_deg": 270,
++   "wave_m": 1.4,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T08:00Z",
++   "wind_kn": 20.0,
++   "gust_kn": 28.0,
++   "wind_dir_deg": 270,
++   "wave_m": 1.7,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T09:00Z",
++   "wind_kn": 22.0,
++   "gust_kn": 30.8,
++   "wind_dir_deg": 270,
++   "wave_m": 2.0,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T10:00Z",
++   "wind_kn": 26.0,
++   "gust_kn": 36.4,
++   "wind_dir_deg": 270,
++   "wave_m": 2.4,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T11:00Z",
++   "wind_kn": 30.0,
++   "gust_kn": 42.0,
++   "wind_dir_deg": 270,
++   "wave_m": 2.9,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T12:00Z",
++   "wind_kn": 28.0,
++   "gust_kn": 39.2,
++   "wind_dir_deg": 270,
++   "wave_m": 3.1,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T13:00Z",
++   "wind_kn": 24.0,
++   "gust_kn": 33.6,
++   "wind_dir_deg": 270,
++   "wave_m": 2.8,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T14:00Z",
++   "wind_kn": 19.0,
++   "gust_kn": 26.6,
++   "wind_dir_deg": 270,
++   "wave_m": 2.4,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T15:00Z",
++   "wind_kn": 16.0,
++   "gust_kn": 22.4,
++   "wind_dir_deg": 270,
++   "wave_m": 2.0,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T16:00Z",
++   "wind_kn": 14.0,
++   "gust_kn": 19.6,
++   "wind_dir_deg": 270,
++   "wave_m": 1.7,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T17:00Z",
++   "wind_kn": 12.0,
++   "gust_kn": 16.8,
++   "wind_dir_deg": 270,
++   "wave_m": 1.4,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T18:00Z",
++   "wind_kn": 11.0,
++   "gust_kn": 15.4,
++   "wind_dir_deg": 270,
++   "wave_m": 1.2,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T19:00Z",
++   "wind_kn": 10.0,
++   "gust_kn": 14.0,
++   "wind_dir_deg": 270,
++   "wave_m": 1.0,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T20:00Z",
++   "wind_kn": 9.0,
++   "gust_kn": 12.6,
++   "wind_dir_deg": 270,
++   "wave_m": 0.9,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T21:00Z",
++   "wind_kn": 9.0,
++   "gust_kn": 12.6,
++   "wind_dir_deg": 270,
++   "wave_m": 0.8,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T22:00Z",
++   "wind_kn": 8.0,
++   "gust_kn": 11.2,
++   "wind_dir_deg": 270,
++   "wave_m": 0.8,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  },
++  {
++   "time": "2026-11-23T23:00Z",
++   "wind_kn": 8.0,
++   "gust_kn": 11.2,
++   "wind_dir_deg": 270,
++   "wave_m": 0.7,
++   "wave_dir_deg": 260,
++   "wave_period_s": 6.0
++  }
++ ]
++}
+\ No newline at end of file
+diff -ruN 03-forecast/services/api/tests/test_scoring.py 04-scoring/services/api/tests/test_scoring.py
+--- 03-forecast/services/api/tests/test_scoring.py	1970-01-01 01:00:00
++++ 04-scoring/services/api/tests/test_scoring.py	2026-11-22 20:19:07
+@@ -0,0 +1,155 @@
++"""Fixture tests for the pure scoring function (R3), including edge cases."""
++
++import json
++from datetime import UTC, datetime, timedelta
++from pathlib import Path
++
++import pytest
++
++from app import scoring
++from app.forecast_client import _hour
++from app.geo import distance_nm
++from app.scoring import HourConditions, Limits, passage_duration_h, score_windows, worst_of
++
++T0 = datetime(2026, 11, 23, tzinfo=UTC)
++LIMITS = Limits(max_wind_kn=20, max_wave_m=2.0, max_gust_kn=28)
++FIXTURES = Path(__file__).parent / "fixtures"
++
++
++def series(wind, wave=None, gust=None, start=T0):
++    n = len(wind)
++    wave = wave if wave is not None else [1.0] * n
++    gust = gust if gust is not None else [w * 1.2 if w is not None else None for w in wind]
++    return [HourConditions(start + timedelta(hours=i), wind[i], gust[i], wave[i]) for i in range(n)]
++
++
++@pytest.fixture(autouse=True)
++def no_margin(monkeypatch):
++    monkeypatch.setattr(scoring, "SAFETY_MARGIN", 0.0)
++
++
++def test_calm_forecast_is_all_go():
++    windows = score_windows(LIMITS, series([10] * 6), duration_h=2)
++    assert len(windows) == 4  # departures 0..3; departure 4 would arrive after the forecast
++    assert all(w.go for w in windows)
++    assert windows[0].reason.startswith("Within limits: max wind 10.0/20.0 kn")
++    assert windows[0].failures == []
++
++
++def test_exactly_at_limit_is_go():
++    windows = score_windows(LIMITS, series([20, 20], wave=[2.0, 2.0], gust=[28, 28]), 1)
++    assert windows[0].go
++
++
++def test_just_above_limit_is_no_go_with_amount():
++    (window,) = score_windows(LIMITS, series([20.1, 15]), duration_h=1)
++    assert not window.go
++    (failure,) = window.failures
++    assert failure.limit == "wind"
++    assert failure.observed == 20.1
++    assert failure.limit_value == 20
++    assert failure.exceeded_by == 0.1
++    assert failure.at == T0
++    assert window.reason == "Wind 20.1 kn exceeds limit 20.0 kn by 0.1 kn at Mon 23 Nov 00:00Z"
++
++
++def test_spike_only_blocks_departures_whose_passage_overlaps_it():
++    wind = [10, 10, 10, 10, 10, 25, 10, 10, 10, 10]
++    windows = score_windows(LIMITS, series(wind), duration_h=2)
++    verdicts = [w.go for w in windows]
++    # Departure at hour h covers hours h..h+2, so hours 3, 4 and 5 see the spike.
++    assert verdicts == [True, True, True, False, False, False, True, True]
++
++
++def test_reports_every_failed_limit_worst_first():
++    (window,) = score_windows(LIMITS, series([22], wave=[3.0], gust=[29]), duration_h=0)
++    assert [f.limit for f in window.failures] == ["waves", "wind", "gusts"]
++    assert window.reason.startswith("Waves 3.00 m exceeds limit 2.00 m by 1.00 m")
++
++
++def test_missing_data_is_no_go_and_listed_first():
++    (window,) = score_windows(LIMITS, series([25], wave=[None]), duration_h=0)
++    assert not window.go
++    assert window.failures[0].limit == "missing_data"
++    assert window.failures[0].message.startswith("No waves forecast at")
++
++
++def test_gusts_ignored_when_boat_has_no_gust_limit():
++    limits = Limits(max_wind_kn=20, max_wave_m=2.0, max_gust_kn=None)
++    (window,) = score_windows(limits, series([15], gust=[45]), duration_h=0)
++    assert window.go
++    assert window.peak["gust_kn"] == 45
++
++
++def test_passage_longer_than_forecast_has_no_windows():
++    assert score_windows(LIMITS, series([10] * 5), duration_h=5) == []
++
++
++def test_zero_length_passage_scores_each_hour():
++    windows = score_windows(LIMITS, series([10, 30, 10]), duration_h=0)
++    assert [w.go for w in windows] == [True, False, True]
++    assert windows[0].arrival == windows[0].departure
++
++
++def test_fractional_duration_includes_first_hour_after_arrival():
++    windows = score_windows(LIMITS, series([10, 10, 30, 10]), duration_h=1.5)
++    assert [w.go for w in windows] == [False, False]
++    assert windows[0].arrival == T0 + timedelta(hours=1.5)
++
++
++def test_departures_before_not_before_are_dropped():
++    windows = score_windows(LIMITS, series([10] * 6), 1, not_before=T0 + timedelta(hours=3))
++    assert [w.departure for w in windows] == [T0 + timedelta(hours=h) for h in (3, 4)]
++
++
++def test_safety_margin_lowers_the_threshold(monkeypatch):
++    monkeypatch.setattr(scoring, "SAFETY_MARGIN", 0.1)
++    (window,) = score_windows(LIMITS, series([19], gust=[20]), duration_h=0)
++    assert not window.go  # 19 kn > 90% of 20 kn
++    assert window.failures[0].limit_value == 18.0
++
++
++def test_invalid_inputs():
++    with pytest.raises(ValueError):
++        score_windows(LIMITS, series([10]), duration_h=-1)
++    with pytest.raises(ValueError):
++        passage_duration_h(10, 0)
++
++
++def test_worst_of_takes_highest_value_per_hour():
++    a = series([10, 12], wave=[None, 1.0])
++    b = series([15, 11], wave=[1.5, None])
++    combined = worst_of(a, b)
++    assert [h.wind_kn for h in combined] == [15, 12]
++    assert [h.wave_m for h in combined] == [1.5, 1.0]
++
++
++def test_worst_of_keeps_only_common_hours():
++    a = series([10, 10, 10])
++    b = series([10, 10], start=T0 + timedelta(hours=1))
++    assert [h.time for h in worst_of(a, b)] == [T0 + timedelta(hours=1), T0 + timedelta(hours=2)]
++    assert worst_of() == []
++
++
++def test_front_passing_fixture():
++    raw = json.loads((FIXTURES / "forecast_front_passing.json").read_text())
++    hours = [_hour(h) for h in raw["hours"]]
++    windows = score_windows(LIMITS, hours, duration_h=4)
++    assert len(windows) == 20
++    go_hours = [w.departure.hour for w in windows if w.go]
++    # 04:00 covers 04:00-08:00 and peaks at exactly 20 kn / 28 kn gusts: GO (at the limit).
++    # 14:00 is NO-GO on waves (2.4 m at 14:00); from 15:00 everything is back within limits.
++    assert go_hours == [0, 1, 2, 3, 4, 15, 16, 17, 18, 19]
++    late = next(w for w in windows if w.departure.hour == 14)
++    assert [f.limit for f in late.failures] == ["waves"]
++    blocked = next(w for w in windows if w.departure.hour == 9)
++    assert blocked.failures[0].limit == "waves"
++    assert "3.10 m exceeds limit 2.00 m by 1.10 m" in blocked.reason
++
++
++def test_distance_and_duration():
++    assert distance_nm(0, 0, 1, 0) == pytest.approx(60.04, abs=0.05)
++    bcn_pmi = distance_nm(41.38, 2.18, 39.57, 2.65)
++    assert 108 < bcn_pmi < 113
++    assert passage_duration_h(bcn_pmi, 6) == pytest.approx(bcn_pmi / 6)
++    assert distance_nm(41.38, 2.18, 41.38, 2.18) == 0
+diff -ruN 03-forecast/services/api/tests/test_windows.py 04-scoring/services/api/tests/test_windows.py
+--- 03-forecast/services/api/tests/test_windows.py	1970-01-01 01:00:00
++++ 04-scoring/services/api/tests/test_windows.py	2026-11-22 20:19:19
+@@ -0,0 +1,151 @@
++"""GET /passages/{id}/windows end to end, with the forecast service faked."""
++
++import json
++from datetime import UTC, datetime
++from pathlib import Path
++
++import httpx
++import pytest
++from fastapi.testclient import TestClient
++
++from app.main import create_app
++
++FRONT = json.loads((Path(__file__).parent / "fixtures" / "forecast_front_passing.json").read_text())
++
++
++class FakeForecastService:
++    def __init__(self) -> None:
++        self.mode = "ok"  # ok | down | timeout | unavailable | stale | garbage
++        self.calls: list[httpx.Request] = []
++
++    def __call__(self, request: httpx.Request) -> httpx.Response:
++        self.calls.append(request)
++        if self.mode == "down":
++            raise httpx.ConnectError("connection refused", request=request)
++        if self.mode == "timeout":
++            raise httpx.ReadTimeout("timed out", request=request)
++        if self.mode == "unavailable":
++            detail = "Forecast unavailable: open-meteo-marine did not answer within 4s"
++            return httpx.Response(503, json={"detail": detail})
++        if self.mode == "garbage":
++            return httpx.Response(200, json={"nope": True})
++        if self.mode == "plain500":
++            return httpx.Response(500, text="oops")
++        return httpx.Response(200, json={**FRONT, "stale": self.mode == "stale"})
++
++
++@pytest.fixture(autouse=True)
++def frozen_clock(monkeypatch):
++    # The fixture forecast starts 2026-11-23 00:00Z; pretend it is 00:20Z that day.
++    monkeypatch.setattr(
++        "app.routers.windows.utcnow", lambda: datetime(2026, 11, 23, 0, 20, tzinfo=UTC)
++    )
++
++
++@pytest.fixture
++def forecast():
++    return FakeForecastService()
++
++
++@pytest.fixture
++def client(settings, forecast):
++    http = httpx.Client(transport=httpx.MockTransport(forecast))
++    with TestClient(create_app(settings, http=http)) as c:
++        yield c
++
++
++@pytest.fixture
++def passage(client, passage_body):
++    # ~18.5 h passage at 6 kn: longer than our 24 h fixture allows for most departures.
++    short = {**passage_body, "end_lat": 41.0, "end_lon": 2.18, "speed_kn": 6}  # ~22.8 nm
++    return client.post("/passages", json=short).json()
++
++
++def test_windows_are_scored(client, passage, forecast):
++    response = client.get(f"/passages/{passage['id']}/windows")
++    assert response.status_code == 200
++    body = response.json()
++    assert body["status"] == "ok"
++    assert body["forecast"] == {
++        "source": "open-meteo",
++        "points": 2,
++        "horizon_hours": 24,
++        "stale": False,
++    }
++    assert body["duration_h"] == pytest.approx(3.8, abs=0.1)
++    assert body["summary"]["windows"] == 20
++    assert body["summary"]["go"] + body["summary"]["no_go"] == 20
++    assert body["summary"]["first_go"].startswith("2026-11-23T00:00")
++    nogo = next(w for w in body["windows"] if not w["go"])
++    assert nogo["failures"][0]["exceeded_by"] > 0
++    assert "exceeds limit" in nogo["reason"]
++    # One forecast call per point, with the configured horizon.
++    assert len(forecast.calls) == 2
++    assert forecast.calls[0].url.params["days"] == "3"
++
++
++def test_same_start_and_end_fetches_one_point(client, passage_body, forecast):
++    body = {
++        **passage_body,
++        "end_lat": passage_body["start_lat"],
++        "end_lon": passage_body["start_lon"],
++    }
++    pid = client.post("/passages", json=body).json()["id"]
++    response = client.get(f"/passages/{pid}/windows")
++    assert response.json()["forecast"]["points"] == 1
++    assert len(forecast.calls) == 1
++
++
++def test_long_passage_explains_empty_result(client, passage_body):
++    far = {**passage_body, "end_lat": 30.0, "speed_kn": 2}
++    pid = client.post("/passages", json=far).json()["id"]
++    body = client.get(f"/passages/{pid}/windows").json()
++    assert body["windows"] == []
++    assert body["summary"]["note"] == "Passage is longer than the forecast horizon."
++
++
++def test_stale_forecast_is_flagged(client, passage, forecast):
++    forecast.mode = "stale"
++    assert client.get(f"/passages/{passage['id']}/windows").json()["forecast"]["stale"] is True
++
++
++@pytest.mark.parametrize(
++    ("mode", "expected"),
++    [
++        ("down", "forecast service is unreachable"),
++        ("timeout", "did not answer within 10s"),
++        ("unavailable", "open-meteo-marine did not answer within 4s"),
++        ("garbage", "unexpected response"),
++        ("plain500", "answered HTTP 500"),
++    ],
++)
++def test_forecast_failure_gives_clear_degraded_response(client, passage, forecast, mode, expected):
++    forecast.mode = mode
++    response = client.get(f"/passages/{passage['id']}/windows")
++    assert response.status_code == 503
++    body = response.json()
++    assert body["status"] == "degraded"
++    assert expected in body["detail"]
++    assert "Boats and passages still work" in body["detail"]
++    assert body["windows"] == []
++
++
++def test_crud_keeps_working_while_forecast_is_down(client, passage, forecast):
++    forecast.mode = "down"
++    assert client.get("/boats").status_code == 200
++    assert client.get(f"/passages/{passage['id']}").status_code == 200
++    created = client.post("/boats", json={"name": "Spare", "max_wind_kn": 18, "max_wave_m": 1.5})
++    assert created.status_code == 201
++
++
++def test_past_departures_are_not_listed(client, passage, monkeypatch):
++    monkeypatch.setattr(
++        "app.routers.windows.utcnow", lambda: datetime(2026, 11, 23, 10, 5, tzinfo=UTC)
++    )
++    body = client.get(f"/passages/{passage['id']}/windows").json()
++    assert body["windows"][0]["departure"].startswith("2026-11-23T10:00")
++    assert body["summary"]["windows"] == 10
++
++
++def test_windows_for_missing_passage_is_404(client):
++    assert client.get("/passages/999/windows").status_code == 404

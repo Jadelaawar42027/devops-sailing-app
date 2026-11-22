@@ -1,0 +1,573 @@
+diff -ruN 05-ui/docker-compose.yml 06-monitoring/docker-compose.yml
+--- 05-ui/docker-compose.yml	2026-11-22 20:22:10
++++ 06-monitoring/docker-compose.yml	2026-11-22 20:27:45
+@@ -52,6 +52,8 @@
+     environment:
+       <<: *db-env
+       DB_NAME: forecast
++      # Overridable so scripts/partial-failure.sh can simulate Open-Meteo being unreachable.
++      OPEN_METEO_MARINE_URL: ${OPEN_METEO_MARINE_URL:-https://marine-api.open-meteo.com/v1/marine}
+       CORS_ORIGINS: http://localhost:8090
+       LOG_LEVEL: INFO
+     depends_on:
+diff -ruN 05-ui/docs/monitoring/README.md 06-monitoring/docs/monitoring/README.md
+--- 05-ui/docs/monitoring/README.md	1970-01-01 01:00:00
++++ 06-monitoring/docs/monitoring/README.md	2026-11-22 20:27:09
+@@ -0,0 +1,65 @@
++# Monitoring
++
++Brief §4 and §6: we use **only the Log Analytics workspace of the Container Apps environment**
++(`sdd-3a-g<N>-logs`). No Application Insights, no extra Azure services.
++
++## How the data gets there
++
++1. Both services write **one JSON line per request** to stdout (`services/*/app/logging_setup.py`):
++   `{"ts", "level", "service", "msg": "request", "method", "path", "route", "status", "duration_ms"}`.
++   Calls to other systems log `{"msg": "upstream call", "upstream", "status", "duration_ms"}`.
++2. Container Apps ships stdout to the environment's Log Analytics workspace
++   (table `ContainerAppConsoleLogs_CL`, column `Log_s`).
++3. The queries in [`queries/`](queries/) parse those lines with `parse_json(Log_s)`.
++   They are also deployed as **saved searches** in the workspace by `infra/main.bicep`
++   (category "Sailing planner"), so nothing is clicked together by hand.
++
++Log volume stays low: INFO level, no request bodies, no headers.
++
++## Dashboard
++
++The dashboard is built from the saved searches. Required tiles (brief §6) are 1 to 3.
++
++| Tile | Query | Shows |
++| --- | --- | --- |
++| 1 | [request-count.kql](queries/request-count.kql) | Requests per service, 5 min bins |
++| 2 | [error-rate.kql](queries/error-rate.kql) | % of 5xx answers per service |
++| 3 | [response-time.kql](queries/response-time.kql) | p50 / p95 / p99 latency per service |
++| 4 | [slo-windows.kql](queries/slo-windows.kql) | The SLO: current SLI vs objective, error budget left |
++| 5 | [slo-windows-trend.kql](queries/slo-windows-trend.kql) | SLI over time against the objective |
++| 6 | [upstream-health.kql](queries/upstream-health.kql) | Forecast service and Open-Meteo calls, failures, p95 |
++| – | [top-routes.kql](queries/top-routes.kql), [recent-errors.kql](queries/recent-errors.kql) | Troubleshooting |
++
++<!-- TODO(team): decide the final dashboard layout (tile order and sizes) and add a screenshot here. -->
++
++To pin the tiles (one time, about 5 minutes):
++
++1. Portal → Log Analytics workspace `sdd-3a-g<N>-logs` → **Logs** → **Queries** → category
++   *Sailing planner*. Open each saved search and run it.
++2. **Pin to** → **Azure dashboard** → *Create new* `sdd-3a-g<N>-dashboard` (shared) for the first
++   tile, then *Existing* for the others.
++3. Set the dashboard time range to *Last 24 hours* and auto-refresh to 5 minutes.
++
++Generate traffic first so the tiles are not empty: `scripts/traffic.sh` (see below).
++
++## SLO
++
++See [slo.md](slo.md).
++
++## Generating demo traffic
++
++```bash
++# Local (docker compose up first)
++scripts/traffic.sh
++
++# Azure (URLs from the README)
++API_URL=https://sdd-3a-g<N>-api.<env>.azurecontainerapps.io \
++FORECAST_URL=https://sdd-3a-g<N>-forecast.<env>.azurecontainerapps.io \
++scripts/traffic.sh 200
++```
++
++Logs reach Log Analytics after 2 to 5 minutes.
++
++## Partial failure
++
++See [../partial-failure.md](../partial-failure.md).
+diff -ruN 05-ui/docs/monitoring/queries/error-rate.kql 06-monitoring/docs/monitoring/queries/error-rate.kql
+--- 05-ui/docs/monitoring/queries/error-rate.kql	1970-01-01 01:00:00
++++ 06-monitoring/docs/monitoring/queries/error-rate.kql	2026-11-22 20:26:47
+@@ -0,0 +1,19 @@
++// Dashboard tile 2: error rate (% of requests answered 5xx) per service, 5-minute bins.
++// 503 "degraded" answers count as errors on purpose: the user did not get their windows.
++// Request log lines written by both services (app/logging_setup.py), one JSON object per line.
++// Works with both table names Container Apps uses (classic *_CL and the newer one).
++let Requests = union isfuzzy=true
++    (ContainerAppConsoleLogs_CL | project TimeGenerated, App = ContainerAppName_s, Line = Log_s),
++    (ContainerAppConsoleLogs | project TimeGenerated, App = ContainerAppName, Line = Log)
++| where Line startswith "{"
++| extend j = parse_json(Line)
++| where tostring(j.msg) == "request"
++| extend service = tostring(j.service), method = tostring(j.method), route = tostring(j.route),
++         status = toint(j.status), duration_ms = todouble(j.duration_ms);
++Requests
++| where TimeGenerated > ago(24h)
++| summarize total = count(), errors = countif(status >= 500), client_errors = countif(status between (400 .. 499))
++    by bin(TimeGenerated, 5m), service
++| extend error_rate_pct = round(100.0 * errors / total, 2)
++| project TimeGenerated, service, error_rate_pct, errors, client_errors, total
++| render timechart
+diff -ruN 05-ui/docs/monitoring/queries/recent-errors.kql 06-monitoring/docs/monitoring/queries/recent-errors.kql
+--- 05-ui/docs/monitoring/queries/recent-errors.kql	1970-01-01 01:00:00
++++ 06-monitoring/docs/monitoring/queries/recent-errors.kql	2026-11-22 20:26:47
+@@ -0,0 +1,12 @@
++// Troubleshooting: the latest warnings and errors from both services (no request bodies are logged).
++union isfuzzy=true
++    (ContainerAppConsoleLogs_CL | project TimeGenerated, App = ContainerAppName_s, Line = Log_s),
++    (ContainerAppConsoleLogs | project TimeGenerated, App = ContainerAppName, Line = Log)
++| where Line startswith "{"
++| extend j = parse_json(Line)
++| extend level = tostring(j.level), status = toint(j.status)
++| where level in ("WARNING", "ERROR") or status >= 500
++| project TimeGenerated, App, level, msg = tostring(j.msg), route = tostring(j.route), status,
++          error = tostring(j.error), reason = tostring(j.reason)
++| order by TimeGenerated desc
++| take 100
+diff -ruN 05-ui/docs/monitoring/queries/request-count.kql 06-monitoring/docs/monitoring/queries/request-count.kql
+--- 05-ui/docs/monitoring/queries/request-count.kql	1970-01-01 01:00:00
++++ 06-monitoring/docs/monitoring/queries/request-count.kql	2026-11-22 20:26:47
+@@ -0,0 +1,15 @@
++// Dashboard tile 1: request count per service, 5-minute bins, last 24 h.
++// Request log lines written by both services (app/logging_setup.py), one JSON object per line.
++// Works with both table names Container Apps uses (classic *_CL and the newer one).
++let Requests = union isfuzzy=true
++    (ContainerAppConsoleLogs_CL | project TimeGenerated, App = ContainerAppName_s, Line = Log_s),
++    (ContainerAppConsoleLogs | project TimeGenerated, App = ContainerAppName, Line = Log)
++| where Line startswith "{"
++| extend j = parse_json(Line)
++| where tostring(j.msg) == "request"
++| extend service = tostring(j.service), method = tostring(j.method), route = tostring(j.route),
++         status = toint(j.status), duration_ms = todouble(j.duration_ms);
++Requests
++| where TimeGenerated > ago(24h)
++| summarize requests = count() by bin(TimeGenerated, 5m), service
++| render timechart
+diff -ruN 05-ui/docs/monitoring/queries/response-time.kql 06-monitoring/docs/monitoring/queries/response-time.kql
+--- 05-ui/docs/monitoring/queries/response-time.kql	1970-01-01 01:00:00
++++ 06-monitoring/docs/monitoring/queries/response-time.kql	2026-11-22 20:26:47
+@@ -0,0 +1,16 @@
++// Dashboard tile 3: response time percentiles (ms) per service, 5-minute bins.
++// Request log lines written by both services (app/logging_setup.py), one JSON object per line.
++// Works with both table names Container Apps uses (classic *_CL and the newer one).
++let Requests = union isfuzzy=true
++    (ContainerAppConsoleLogs_CL | project TimeGenerated, App = ContainerAppName_s, Line = Log_s),
++    (ContainerAppConsoleLogs | project TimeGenerated, App = ContainerAppName, Line = Log)
++| where Line startswith "{"
++| extend j = parse_json(Line)
++| where tostring(j.msg) == "request"
++| extend service = tostring(j.service), method = tostring(j.method), route = tostring(j.route),
++         status = toint(j.status), duration_ms = todouble(j.duration_ms);
++Requests
++| where TimeGenerated > ago(24h)
++| summarize p50 = percentile(duration_ms, 50), p95 = percentile(duration_ms, 95),
++            p99 = percentile(duration_ms, 99) by bin(TimeGenerated, 5m), service
++| render timechart
+diff -ruN 05-ui/docs/monitoring/queries/slo-windows-trend.kql 06-monitoring/docs/monitoring/queries/slo-windows-trend.kql
+--- 05-ui/docs/monitoring/queries/slo-windows-trend.kql	1970-01-01 01:00:00
++++ 06-monitoring/docs/monitoring/queries/slo-windows-trend.kql	2026-11-22 20:26:47
+@@ -0,0 +1,20 @@
++// SLO trend: the windows SLI per 5-minute bin, with the objective drawn as a line.
++let objective_pct = 99.0; // TODO(team): keep in sync with slo-windows.kql
++let target_ms = 1000.0;
++// Request log lines written by both services (app/logging_setup.py), one JSON object per line.
++// Works with both table names Container Apps uses (classic *_CL and the newer one).
++let Requests = union isfuzzy=true
++    (ContainerAppConsoleLogs_CL | project TimeGenerated, App = ContainerAppName_s, Line = Log_s),
++    (ContainerAppConsoleLogs | project TimeGenerated, App = ContainerAppName, Line = Log)
++| where Line startswith "{"
++| extend j = parse_json(Line)
++| where tostring(j.msg) == "request"
++| extend service = tostring(j.service), method = tostring(j.method), route = tostring(j.route),
++         status = toint(j.status), duration_ms = todouble(j.duration_ms);
++Requests
++| where TimeGenerated > ago(24h)
++| where service == "api" and method == "GET" and route == "/passages/{passage_id}/windows"
++| summarize sli_pct = round(100.0 * countif(status < 500 and duration_ms < target_ms) / count(), 2)
++    by bin(TimeGenerated, 5m)
++| extend objective_pct = objective_pct
++| render timechart
+diff -ruN 05-ui/docs/monitoring/queries/slo-windows.kql 06-monitoring/docs/monitoring/queries/slo-windows.kql
+--- 05-ui/docs/monitoring/queries/slo-windows.kql	1970-01-01 01:00:00
++++ 06-monitoring/docs/monitoring/queries/slo-windows.kql	2026-11-22 20:27:09
+@@ -0,0 +1,24 @@
++// SLO: 99% of GET /passages/{id}/windows requests answer successfully in under 1 s, over 1 h.
++// "Good" = status below 500 AND duration under the target. A 503 "degraded" answer is bad.
++// TODO(team): agree the SLO target numbers (objective and latency) and keep docs/monitoring/slo.md in sync.
++let objective_pct = 99.0;
++let target_ms = 1000.0;
++let slo_window = 1h;
++// Request log lines written by both services (app/logging_setup.py), one JSON object per line.
++// Works with both table names Container Apps uses (classic *_CL and the newer one).
++let Requests = union isfuzzy=true
++    (ContainerAppConsoleLogs_CL | project TimeGenerated, App = ContainerAppName_s, Line = Log_s),
++    (ContainerAppConsoleLogs | project TimeGenerated, App = ContainerAppName, Line = Log)
++| where Line startswith "{"
++| extend j = parse_json(Line)
++| where tostring(j.msg) == "request"
++| extend service = tostring(j.service), method = tostring(j.method), route = tostring(j.route),
++         status = toint(j.status), duration_ms = todouble(j.duration_ms);
++Requests
++| where TimeGenerated > ago(slo_window)
++| where service == "api" and method == "GET" and route == "/passages/{passage_id}/windows"
++| summarize total = count(), good = countif(status < 500 and duration_ms < target_ms)
++| extend sli_pct = iff(total == 0, real(null), round(100.0 * good / total, 2))
++| extend objective_pct = objective_pct, slo_met = sli_pct >= objective_pct,
++         error_budget_left_pct = iff(total == 0, real(null),
++             round(100.0 * (1 - (total - good) / ((1 - objective_pct / 100) * total)), 1))
+diff -ruN 05-ui/docs/monitoring/queries/top-routes.kql 06-monitoring/docs/monitoring/queries/top-routes.kql
+--- 05-ui/docs/monitoring/queries/top-routes.kql	1970-01-01 01:00:00
++++ 06-monitoring/docs/monitoring/queries/top-routes.kql	2026-11-22 20:26:47
+@@ -0,0 +1,16 @@
++// Dashboard tile 4: busiest and slowest routes in the last hour.
++// Request log lines written by both services (app/logging_setup.py), one JSON object per line.
++// Works with both table names Container Apps uses (classic *_CL and the newer one).
++let Requests = union isfuzzy=true
++    (ContainerAppConsoleLogs_CL | project TimeGenerated, App = ContainerAppName_s, Line = Log_s),
++    (ContainerAppConsoleLogs | project TimeGenerated, App = ContainerAppName, Line = Log)
++| where Line startswith "{"
++| extend j = parse_json(Line)
++| where tostring(j.msg) == "request"
++| extend service = tostring(j.service), method = tostring(j.method), route = tostring(j.route),
++         status = toint(j.status), duration_ms = todouble(j.duration_ms);
++Requests
++| where TimeGenerated > ago(1h)
++| summarize requests = count(), errors = countif(status >= 500),
++            p95_ms = round(percentile(duration_ms, 95), 1) by service, method, route
++| order by requests desc
+diff -ruN 05-ui/docs/monitoring/queries/upstream-health.kql 06-monitoring/docs/monitoring/queries/upstream-health.kql
+--- 05-ui/docs/monitoring/queries/upstream-health.kql	1970-01-01 01:00:00
++++ 06-monitoring/docs/monitoring/queries/upstream-health.kql	2026-11-22 20:26:47
+@@ -0,0 +1,13 @@
++// Dependency health: calls from the API to the forecast service, and from the forecast
++// service to Open-Meteo. status is empty when the call timed out or could not connect.
++union isfuzzy=true
++    (ContainerAppConsoleLogs_CL | project TimeGenerated, Line = Log_s),
++    (ContainerAppConsoleLogs | project TimeGenerated, Line = Log)
++| where Line startswith "{"
++| extend j = parse_json(Line)
++| where tostring(j.msg) == "upstream call"
++| extend upstream = tostring(j.upstream), status = toint(j.status), duration_ms = todouble(j.duration_ms)
++| where TimeGenerated > ago(24h)
++| summarize calls = count(), failures = countif(isnull(status) or status >= 400),
++            p95_ms = round(percentile(duration_ms, 95), 1) by bin(TimeGenerated, 15m), upstream
++| order by TimeGenerated desc
+diff -ruN 05-ui/docs/monitoring/slo.md 06-monitoring/docs/monitoring/slo.md
+--- 05-ui/docs/monitoring/slo.md	1970-01-01 01:00:00
++++ 06-monitoring/docs/monitoring/slo.md	2026-11-22 20:27:09
+@@ -0,0 +1,35 @@
++# Service Level Objective
++
++<!-- TODO(team): agree the target numbers below; keep queries/slo-windows*.kql in sync. -->
++
++| | |
++| --- | --- |
++| **User journey** | "Show me when I can leave": `GET /passages/{id}/windows` on the API |
++| **SLI** | Share of those requests that answer with a status below 500 **and** in under 1000 ms |
++| **Objective** | **99%** over a rolling **1 hour** window |
++| **Error budget** | 1% of requests per hour may be slow or fail |
++| **Measured by** | [queries/slo-windows.kql](queries/slo-windows.kql) (current value) and [queries/slo-windows-trend.kql](queries/slo-windows-trend.kql) (trend) |
++
++## Why this journey
++
++It is the feature beyond CRUD and the only request that crosses both services and the external
++API, so it is the first thing to break and the one users care about.
++
++## Why 503 counts as bad
++
++When the forecast service is down the API answers fast with a clear `503 degraded` message
++(see [../partial-failure.md](../partial-failure.md)). That is the correct behaviour, but the user
++still did not get their windows, so it burns error budget.
++
++## Known risks to the objective
++
++- **Scale to zero.** Both Container Apps scale to zero (brief §4). The first request after an idle
++  period waits for a cold start, and Azure SQL serverless may also need up to a minute to resume.
++  With little demo traffic this alone can break a 1-hour objective.
++- **Cache misses.** A new location means two Open-Meteo calls per point. Repeat requests hit the
++  forecast service's cache and are much faster.
++
++## What we do when the budget is spent
++
++Look at tile 6 (upstream health) and `recent-errors.kql` first; then check the Container Apps
++revision and recent deploys. Feature work pauses until the SLI is back above the objective.
+diff -ruN 05-ui/docs/partial-failure.md 06-monitoring/docs/partial-failure.md
+--- 05-ui/docs/partial-failure.md	1970-01-01 01:00:00
++++ 06-monitoring/docs/partial-failure.md	2026-11-22 20:28:36
+@@ -0,0 +1,79 @@
++# Partial-failure test
++
++Brief §6: *"with one service down (or an external API failing), the other keeps working and the
++affected flow fails with a timeout and a clear message, not a stack trace or a hung request."*
++
++The test is a script, so anyone can repeat it: `scripts/partial-failure.sh`. It exits `0` when
++every check passes and always restores the system, even if interrupted.
++
++## What protects us
++
++| Failure | Where it is handled | What the user gets |
++| --- | --- | --- |
++| Forecast service down or slow | `services/api/app/forecast_client.py` (10 s timeout) and `routers/windows.py` | `503 {"status": "degraded", "detail": "Forecast unavailable: … Boats and passages still work…"}`. Boats and passages keep working. The UI shows the message in a banner. |
++| Open-Meteo down or slow | `services/forecast/app/openmeteo.py` (4 s timeout) and `service.py` | The last cached forecast, marked `"stale": true`, or a `503` with a clear reason when nothing is cached. |
++| Azure SQL paused or unreachable | `app/db.py` (startup retries, `pool_pre_ping`) and the `OperationalError` handler in `app/main.py` | `503 "Database unavailable, please retry in a few seconds."` |
++
++Automated tests cover each path without Docker:
++`services/api/tests/test_windows.py::test_forecast_failure_gives_clear_degraded_response`,
++`test_crud_keeps_working_while_forecast_is_down`, and `services/forecast/tests/test_forecast.py`
++(`timeout`, `http500`, `stale` cases).
++
++## Scenario A: the forecast service is stopped (local)
++
++```bash
++docker compose up -d --build
++scripts/partial-failure.sh
++```
++
++Steps the script performs and checks:
++
++1. Baseline: `GET /passages/{id}/windows` returns `200`.
++2. `docker compose stop forecast`.
++3. `GET /passages/{id}/windows` returns **503** with `status: degraded` in **well under 15 s**
++   and no stack trace. `GET /boats` returns 200; `POST /boats` still creates a boat.
++4. `docker compose start forecast` and wait for `/health`.
++5. Windows return `200` again.
++
++Expected output (recorded 2026-11-22 on a laptop):
++
++```text
++3. Checks while it is down
++  windows answered HTTP 503 in 0.008383s: Forecast unavailable: forecast service is unreachable (ConnectError). Boats and passages still work; try the windows again in a minute.
++  PASS  windows returns 503, not 500
++  PASS  body says status=degraded
++  PASS  answered in under 15s (no hung request)
++  PASS  no stack trace in the response
++  PASS  GET /boats still 200
++  PASS  POST /boats still works (id 4)
++...
++RESULT: PASS
++```
++
++## Scenario B: Open-Meteo is unreachable (local)
++
++```bash
++scripts/partial-failure.sh upstream
++```
++
++The script restarts the forecast service with `OPEN_METEO_MARINE_URL` pointing at an unroutable
++address, so every upstream call hits the 4 s timeout. A location that was never cached returns a
++clear `503` (`"open-meteo-marine did not answer within 4s; no cached data for this location"`);
++a cached passage still gets its windows from the cache (marked stale once the cache entry is older
++than 30 minutes). Then it restores the normal URL.
++
++## Scenario C: in Azure (for the Sprint Review)
++
++Run it against the deployed system (needs `az login` with access to the resource group). It disables
++ingress on the forecast Container App for about a minute and re-enables it on exit.
++
++```bash
++API_URL=https://<api-fqdn> FORECAST_URL=https://<forecast-fqdn> \
++RESOURCE_GROUP=rg-sdd-3a-g<N> PREFIX=sdd-3a-g<N> \
++scripts/partial-failure.sh azure
++```
++
++While it runs, open the UI: the planner shows the red "Forecast unavailable" banner while the
++Boats and Passages pages keep working. Afterwards, `docs/monitoring/queries/error-rate.kql` and
++`upstream-health.kql` show the spike. The next CD run puts the ingress back in its declared state
++anyway (infra is re-applied from Bicep on every deploy).
+diff -ruN 05-ui/scripts/partial-failure.sh 06-monitoring/scripts/partial-failure.sh
+--- 05-ui/scripts/partial-failure.sh	1970-01-01 01:00:00
++++ 06-monitoring/scripts/partial-failure.sh	2026-11-22 20:27:45
+@@ -0,0 +1,135 @@
++#!/usr/bin/env bash
++# Repeatable partial-failure test (brief §6). See docs/partial-failure.md.
++#
++#   scripts/partial-failure.sh              forecast service stopped (local, docker compose)
++#   scripts/partial-failure.sh upstream     Open-Meteo unreachable (local, docker compose)
++#   scripts/partial-failure.sh azure        forecast service unreachable in Azure (needs az login)
++#
++# Exit code 0 = every check passed. The system is always restored at the end.
++set -uo pipefail
++
++MODE="${1:-forecast}"
++API_URL="${API_URL:-http://localhost:8010}"
++FORECAST_URL="${FORECAST_URL:-http://localhost:8011}"
++MAX_SECONDS="${MAX_SECONDS:-15}"   # the degraded answer must come back faster than this
++FAILURES=0
++
++pass() { echo "  PASS  $*"; }
++fail() { echo "  FAIL  $*"; FAILURES=$((FAILURES + 1)); }
++need() { command -v "$1" >/dev/null || { echo "needs $1"; exit 2; }; }
++need curl; need python3
++
++field() { python3 -c "import json,sys; print(json.load(sys.stdin).get('$1',''))" 2>/dev/null; }
++
++wait_for() { # url seconds
++  for ((s = 0; s < $2; s += 2)); do curl -sf -m 5 "$1" >/dev/null && return 0; sleep 2; done
++  return 1
++}
++
++demo_passage() {
++  local id
++  id=$(curl -sf -m 20 "$API_URL/passages" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0]["id"] if d else "")')
++  if [[ -z "$id" ]]; then
++    local boat
++    boat=$(curl -sf -m 20 -X POST -H 'Content-Type: application/json' \
++      -d '{"name":"Failure-test boat","max_wind_kn":20,"max_wave_m":2}' "$API_URL/boats" | field id)
++    id=$(curl -sf -m 20 -X POST -H 'Content-Type: application/json' \
++      -d "{\"name\":\"Failure-test passage\",\"boat_id\":$boat,\"start_lat\":41.37,\"start_lon\":2.19,\"end_lat\":41.23,\"end_lon\":1.81,\"speed_kn\":6}" \
++      "$API_URL/passages" | field id)
++  fi
++  echo "$id"
++}
++
++check_degraded() { # passage_id
++  local out code secs body
++  out=$(curl -s -m 60 -w '\n%{http_code} %{time_total}' "$API_URL/passages/$1/windows")
++  body=$(echo "$out" | sed '$d'); read -r code secs <<<"$(echo "$out" | tail -1)"
++  echo "  windows answered HTTP $code in ${secs}s: $(echo "$body" | field detail)"
++  [[ "$code" == "503" ]] && pass "windows returns 503, not 500" || fail "expected 503, got $code"
++  [[ "$(echo "$body" | field status)" == "degraded" ]] && pass "body says status=degraded" || fail "no status=degraded in body"
++  python3 -c "import sys; sys.exit(0 if float('$secs') < $MAX_SECONDS else 1)" \
++    && pass "answered in under ${MAX_SECONDS}s (no hung request)" || fail "took ${secs}s"
++  echo "$body" | grep -q 'Traceback' && fail "stack trace leaked" || pass "no stack trace in the response"
++}
++
++check_crud_still_works() {
++  [[ "$(curl -s -o /dev/null -w '%{http_code}' -m 20 "$API_URL/boats")" == "200" ]] \
++    && pass "GET /boats still 200" || fail "GET /boats broken"
++  local id
++  id=$(curl -s -m 20 -X POST -H 'Content-Type: application/json' \
++    -d '{"name":"Created while degraded","max_wind_kn":15,"max_wave_m":1.5}' "$API_URL/boats" | field id)
++  if [[ -n "$id" ]]; then
++    pass "POST /boats still works (id $id)"
++    curl -s -o /dev/null -m 20 -X DELETE "$API_URL/boats/$id"
++  else
++    fail "POST /boats broken"
++  fi
++}
++
++echo "Partial-failure test: mode=$MODE"
++wait_for "$API_URL/health" 60 || { echo "API not up at $API_URL"; exit 2; }
++PID=$(demo_passage)
++echo "Using passage $PID"
++
++echo "1. Baseline"
++code=$(curl -s -o /dev/null -w '%{http_code}' -m 60 "$API_URL/passages/$PID/windows")
++[[ "$code" == "200" ]] && pass "windows 200 before the failure" || fail "baseline windows answered $code"
++
++case "$MODE" in
++  forecast)
++    echo "2. Stop the forecast service"
++    trap 'docker compose start forecast >/dev/null 2>&1' EXIT
++    docker compose stop forecast >/dev/null 2>&1
++    echo "3. Checks while it is down"
++    check_degraded "$PID"
++    check_crud_still_works
++    echo "4. Restore"
++    docker compose start forecast >/dev/null 2>&1
++    wait_for "$FORECAST_URL/health" 90 && pass "forecast service back" || fail "forecast did not come back"
++    ;;
++  upstream)
++    echo "2. Point the forecast service at an unroutable Open-Meteo (requests time out)"
++    trap 'docker compose up -d forecast >/dev/null 2>&1' EXIT
++    OPEN_METEO_MARINE_URL="http://10.255.255.1/v1/marine" docker compose up -d forecast >/dev/null 2>&1
++    wait_for "$FORECAST_URL/health" 90 || fail "forecast did not restart"
++    echo "3. Checks while Open-Meteo is unreachable"
++    # A location never seen before has no cache: expect a clear 503 from the forecast service.
++    out=$(curl -s -m 60 -w '\n%{http_code}' "$FORECAST_URL/current?lat=12.34&lon=-45.67")
++    [[ "$(echo "$out" | tail -1)" == "503" ]] && pass "uncached location: 503 '$(echo "$out" | sed '$d' | field detail)'" \
++      || fail "uncached location did not return 503"
++    # The demo passage was cached by the baseline call: the stale copy can be served.
++    code=$(curl -s -o /dev/null -w '%{http_code}' -m 60 "$API_URL/passages/$PID/windows")
++    [[ "$code" == "200" || "$code" == "503" ]] && pass "windows answered $code (200 = from cache, 503 = degraded)" \
++      || fail "windows answered $code"
++    check_crud_still_works
++    echo "4. Restore"
++    docker compose up -d forecast >/dev/null 2>&1
++    wait_for "$FORECAST_URL/health" 90 && pass "forecast service restored" || fail "forecast did not come back"
++    ;;
++  azure)
++    need az
++    : "${RESOURCE_GROUP:?set RESOURCE_GROUP, e.g. rg-sdd-3a-g3}" "${PREFIX:?set PREFIX, e.g. sdd-3a-g3}"
++    APP="$PREFIX-forecast"
++    echo "2. Disable ingress on $APP (temporary; restored on exit)"
++    trap 'az containerapp ingress enable -n "$APP" -g "$RESOURCE_GROUP" --type external --target-port 8000 --transport auto >/dev/null' EXIT
++    az containerapp ingress disable -n "$APP" -g "$RESOURCE_GROUP" >/dev/null
++    sleep 20
++    echo "3. Checks while it is unreachable"
++    check_degraded "$PID"
++    check_crud_still_works
++    echo "4. Restore"
++    az containerapp ingress enable -n "$APP" -g "$RESOURCE_GROUP" --type external --target-port 8000 --transport auto >/dev/null
++    trap - EXIT
++    pass "ingress re-enabled"
++    ;;
++  *) echo "unknown mode $MODE"; exit 2 ;;
++esac
++
++echo "5. After recovery"
++sleep 2
++code=$(curl -s -o /dev/null -w '%{http_code}' -m 60 "$API_URL/passages/$PID/windows")
++[[ "$code" == "200" ]] && pass "windows 200 again" || fail "windows answered $code after recovery"
++
++echo
++if [[ $FAILURES -eq 0 ]]; then echo "RESULT: PASS"; else echo "RESULT: FAIL ($FAILURES checks)"; fi
++exit $FAILURES
+diff -ruN 05-ui/scripts/traffic.sh 06-monitoring/scripts/traffic.sh
+--- 05-ui/scripts/traffic.sh	1970-01-01 01:00:00
++++ 06-monitoring/scripts/traffic.sh	2026-11-22 20:27:51
+@@ -0,0 +1,60 @@
++#!/usr/bin/env bash
++# Generate demo traffic so the monitoring dashboard and SLO have data.
++#
++#   scripts/traffic.sh [ROUNDS]          default 50 rounds
++#   API_URL=... FORECAST_URL=... scripts/traffic.sh 200
++#
++# Each round: health checks, list boats/passages, the windows of every passage, current
++# conditions, and one request that is expected to 404 (so the error panels are not flat zero).
++# Creates a demo boat + passage if there are none. Read-only otherwise.
++set -euo pipefail
++
++API_URL="${API_URL:-http://localhost:8010}"
++FORECAST_URL="${FORECAST_URL:-http://localhost:8011}"
++ROUNDS="${1:-50}"
++PAUSE="${PAUSE:-0.5}"
++CODES_FILE=$(mktemp)
++trap 'rm -f "$CODES_FILE"' EXIT
++
++call() { # method url [json]
++  local code
++  if [[ $# -ge 3 ]]; then
++    code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 -X "$1" -H 'Content-Type: application/json' -d "$3" "$2" || true)
++  else
++    code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 -X "$1" "$2" || true)
++  fi
++  echo "$code" >>"$CODES_FILE"
++}
++
++json_ids() { python3 -c 'import json,sys; print(" ".join(str(x["id"]) for x in json.load(sys.stdin)))'; }
++
++echo "API:      $API_URL"
++echo "Forecast: $FORECAST_URL"
++curl -sf -m 60 "$API_URL/health" >/dev/null || { echo "API is not answering /health"; exit 1; }
++
++passages=$(curl -sf -m 20 "$API_URL/passages" | json_ids)
++if [[ -z "$passages" ]]; then
++  echo "No passages yet: creating a demo boat and passage."
++  boat=$(curl -sf -m 20 -X POST -H 'Content-Type: application/json' \
++    -d '{"name":"Demo yacht","max_wind_kn":20,"max_gust_kn":28,"max_wave_m":2}' "$API_URL/boats" \
++    | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
++  curl -sf -m 20 -X POST -H 'Content-Type: application/json' \
++    -d "{\"name\":\"Demo: Barcelona to Sitges\",\"boat_id\":$boat,\"start_lat\":41.37,\"start_lon\":2.19,\"end_lat\":41.23,\"end_lon\":1.81,\"speed_kn\":6}" \
++    "$API_URL/passages" >/dev/null
++  passages=$(curl -sf -m 20 "$API_URL/passages" | json_ids)
++fi
++
++for ((i = 1; i <= ROUNDS; i++)); do
++  call GET "$API_URL/health"
++  call GET "$FORECAST_URL/health"
++  call GET "$API_URL/boats"
++  call GET "$API_URL/passages"
++  for id in $passages; do call GET "$API_URL/passages/$id/windows"; done
++  call GET "$FORECAST_URL/current?lat=41.37&lon=2.19"
++  call GET "$API_URL/passages/999999"   # expected 404
++  printf '\rround %d/%d' "$i" "$ROUNDS"
++  sleep "$PAUSE"
++done
++echo
++echo "Status codes (count, code):"
++sort "$CODES_FILE" | uniq -c

@@ -1,0 +1,1045 @@
+diff -ruN 02-crud/docker-compose.yml 03-forecast/docker-compose.yml
+--- 02-crud/docker-compose.yml	2026-11-22 20:13:58
++++ 03-forecast/docker-compose.yml	2026-11-22 20:15:58
+@@ -48,8 +48,13 @@
+     ports:
+       - "8011:8000"
+     environment:
++      <<: *db-env
++      DB_NAME: forecast
+       CORS_ORIGINS: http://localhost:8090
+       LOG_LEVEL: INFO
++    depends_on:
++      db:
++        condition: service_healthy
+ 
+ volumes:
+   dbdata:
+diff -ruN 02-crud/services/forecast/Dockerfile 03-forecast/services/forecast/Dockerfile
+--- 02-crud/services/forecast/Dockerfile	2026-11-22 20:09:27
++++ 03-forecast/services/forecast/Dockerfile	2026-11-22 20:15:19
+@@ -6,12 +6,26 @@
+     PIP_NO_CACHE_DIR=1 \
+     PIP_DISABLE_PIP_VERSION_CHECK=1
+ 
++# Microsoft ODBC Driver 18 (needed by pyodbc for Azure SQL / SQL Server).
++RUN apt-get update \
++    && apt-get install -y --no-install-recommends curl gnupg ca-certificates \
++    && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
++       | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
++    && echo "deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
++       > /etc/apt/sources.list.d/mssql-release.list \
++    && apt-get update \
++    && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 unixodbc \
++    && apt-get purge -y curl gnupg && apt-get autoremove -y \
++    && rm -rf /var/lib/apt/lists/*
++
+ WORKDIR /app
+ RUN groupadd --system app && useradd --system --gid app --no-create-home app
+ 
+ # Dependencies first (pinned), then only the code the service needs. No "COPY . .".
+ COPY requirements.txt ./
+ RUN pip install -r requirements.txt
++COPY alembic.ini ./
++COPY migrations ./migrations
+ COPY app ./app
+ 
+ USER app
+diff -ruN 02-crud/services/forecast/alembic.ini 03-forecast/services/forecast/alembic.ini
+--- 02-crud/services/forecast/alembic.ini	1970-01-01 01:00:00
++++ 03-forecast/services/forecast/alembic.ini	2026-11-22 20:15:19
+@@ -0,0 +1,5 @@
++# Used only to create new migrations from the CLI:
++#   DATABASE_URL=sqlite:///./local.db alembic revision -m "describe change"
++# Migrations are applied automatically on startup (app/db.py).
++[alembic]
++script_location = migrations
+diff -ruN 02-crud/services/forecast/app/cache.py 03-forecast/services/forecast/app/cache.py
+--- 02-crud/services/forecast/app/cache.py	1970-01-01 01:00:00
++++ 03-forecast/services/forecast/app/cache.py	2026-11-22 20:15:19
+@@ -0,0 +1,43 @@
++"""Forecast cache stored in this service's own database (brief §3a: one DB per service)."""
++
++import json
++from datetime import timedelta
++
++from sqlalchemy import delete, select
++from sqlalchemy.exc import IntegrityError
++from sqlalchemy.orm import Session
++
++from app.models import ForecastCacheEntry, utcnow
++
++KEEP_ROWS_FOR = timedelta(days=7)
++
++
++def cache_key(kind: str, lat: float, lon: float, days: int | None = None) -> str:
++    key = f"{kind}:{lat:.2f}:{lon:.2f}"
++    return f"{key}:{days}" if days else key
++
++
++def get(session: Session, key: str) -> tuple[dict, float] | None:
++    """Return (payload, age_seconds) or None."""
++    entry = session.scalar(select(ForecastCacheEntry).where(ForecastCacheEntry.cache_key == key))
++    if entry is None:
++        return None
++    age = (utcnow() - entry.fetched_at).total_seconds()
++    return json.loads(entry.payload), age
++
++
++def put(session: Session, key: str, payload: dict) -> None:
++    now = utcnow()
++    entry = session.scalar(select(ForecastCacheEntry).where(ForecastCacheEntry.cache_key == key))
++    if entry is None:
++        session.add(ForecastCacheEntry(cache_key=key, payload=json.dumps(payload), fetched_at=now))
++    else:
++        entry.payload = json.dumps(payload)
++        entry.fetched_at = now
++    session.execute(
++        delete(ForecastCacheEntry).where(ForecastCacheEntry.fetched_at < now - KEEP_ROWS_FOR)
++    )
++    try:
++        session.commit()
++    except IntegrityError:  # a concurrent request stored the same key first: fine
++        session.rollback()
+diff -ruN 02-crud/services/forecast/app/config.py 03-forecast/services/forecast/app/config.py
+--- 02-crud/services/forecast/app/config.py	2026-11-22 20:09:46
++++ 03-forecast/services/forecast/app/config.py	2026-11-22 20:15:19
+@@ -3,22 +3,75 @@
+ import os
+ from dataclasses import dataclass
+ 
++from sqlalchemy.engine import URL
+ 
++ODBC_DRIVER = "ODBC Driver 18 for SQL Server"
++
++
+ def _csv(value: str) -> list[str]:
+     return [item.strip() for item in value.split(",") if item.strip()]
+ 
+ 
++def _bool(value: str | None, default: bool = False) -> bool:
++    if value is None:
++        return default
++    return value.strip().lower() in {"1", "true", "yes", "on"}
++
++
+ @dataclass(frozen=True)
+ class Settings:
+     service_name: str = "forecast"
+     version: str = "dev"
+     log_level: str = "INFO"
+     cors_origins: tuple[str, ...] = ("http://localhost:8090",)
++    database_url: str | URL = "sqlite:///./local.db"
++    db_create_if_missing: bool = False
++    db_connect_retries: int = 20
++    db_retry_delay_s: float = 5.0
++    run_migrations: bool = True
++    # Open-Meteo (free, no API key). Wind from the weather API, waves from the Marine API.
++    weather_url: str = "https://api.open-meteo.com/v1/forecast"
++    marine_url: str = "https://marine-api.open-meteo.com/v1/marine"
++    upstream_timeout_s: float = 4.0
++    forecast_ttl_s: int = 1800  # hourly forecasts change slowly: 30 min cache
++    current_ttl_s: int = 600  # current conditions: 10 min cache
++    forecast_days: int = 3
+ 
+ 
++def database_url_from_env() -> str | URL:
++    """DATABASE_URL wins; otherwise build an Azure SQL / SQL Server URL from DB_* variables."""
++    if os.getenv("DATABASE_URL"):
++        return os.environ["DATABASE_URL"]
++    host = os.getenv("DB_HOST")
++    if not host:
++        return "sqlite:///./local.db"
++    return URL.create(
++        "mssql+pyodbc",
++        username=os.getenv("DB_USER"),
++        password=os.getenv("DB_PASSWORD"),
++        host=host,
++        port=int(os.getenv("DB_PORT", "1433")),
++        database=os.getenv("DB_NAME", "forecast"),
++        query={
++            "driver": ODBC_DRIVER,
++            "Encrypt": "yes",
++            "TrustServerCertificate": "yes" if _bool(os.getenv("DB_TRUST_CERT")) else "no",
++        },
++    )
++
++
+ def load_settings() -> Settings:
+     return Settings(
+         version=os.getenv("APP_VERSION", "dev"),
+         log_level=os.getenv("LOG_LEVEL", "INFO"),
+         cors_origins=tuple(_csv(os.getenv("CORS_ORIGINS", "http://localhost:8090"))),
++        database_url=database_url_from_env(),
++        db_create_if_missing=_bool(os.getenv("DB_CREATE_IF_MISSING")),
++        db_connect_retries=int(os.getenv("DB_CONNECT_RETRIES", "20")),
++        db_retry_delay_s=float(os.getenv("DB_RETRY_DELAY_S", "5")),
++        weather_url=os.getenv("OPEN_METEO_WEATHER_URL", Settings.weather_url),
++        marine_url=os.getenv("OPEN_METEO_MARINE_URL", Settings.marine_url),
++        upstream_timeout_s=float(os.getenv("UPSTREAM_TIMEOUT_S", "4")),
++        forecast_ttl_s=int(os.getenv("FORECAST_TTL_S", "1800")),
++        current_ttl_s=int(os.getenv("CURRENT_TTL_S", "600")),
+     )
+diff -ruN 02-crud/services/forecast/app/db.py 03-forecast/services/forecast/app/db.py
+--- 02-crud/services/forecast/app/db.py	1970-01-01 01:00:00
++++ 03-forecast/services/forecast/app/db.py	2026-11-22 20:15:19
+@@ -0,0 +1,81 @@
++"""Database engine, sessions and migrations-on-startup (brief §3a: versioned migrations)."""
++
++import logging
++import time
++from collections.abc import Iterator
++from pathlib import Path
++from typing import Annotated
++
++from alembic import command
++from alembic.config import Config
++from fastapi import Depends, Request
++from sqlalchemy import Engine, create_engine, text
++from sqlalchemy.engine import URL, make_url
++from sqlalchemy.orm import Session, sessionmaker
++from sqlalchemy.pool import StaticPool
++
++from app.config import Settings
++
++log = logging.getLogger(__name__)
++MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
++
++
++def make_engine(url: str | URL) -> Engine:
++    url = make_url(url)
++    if url.get_backend_name() == "sqlite":
++        kwargs = {"connect_args": {"check_same_thread": False}}
++        if url.database in (None, "", ":memory:"):
++            kwargs["poolclass"] = StaticPool
++        return create_engine(url, **kwargs)
++    # pool_pre_ping: Azure SQL serverless auto-pauses; drop dead connections instead of failing.
++    return create_engine(url, pool_pre_ping=True, pool_recycle=1800)
++
++
++def create_database_if_missing(url: str | URL) -> None:
++    """Local compose only: SQL Server starts empty, so create the service's database."""
++    url = make_url(url)
++    if url.get_backend_name() != "mssql":
++        return
++    name = url.database
++    master = create_engine(url.set(database="master"), isolation_level="AUTOCOMMIT")
++    try:
++        with master.connect() as conn:
++            conn.execute(text(f"IF DB_ID(N'{name}') IS NULL CREATE DATABASE [{name}]"))
++    finally:
++        master.dispose()
++
++
++def run_migrations(engine: Engine) -> None:
++    cfg = Config()
++    cfg.set_main_option("script_location", str(MIGRATIONS_DIR))
++    with engine.begin() as connection:
++        cfg.attributes["connection"] = connection
++        command.upgrade(cfg, "head")
++
++
++def prepare_database(settings: Settings, engine: Engine) -> None:
++    """Create (local only) and migrate the database, retrying while it wakes up."""
++    for attempt in range(1, settings.db_connect_retries + 1):
++        try:
++            if settings.db_create_if_missing:
++                create_database_if_missing(settings.database_url)
++            run_migrations(engine)
++            log.info("migrations applied", extra={"fields": {"attempt": attempt}})
++            return
++        except Exception as exc:  # any DB error during startup is retried
++            if attempt == settings.db_connect_retries:
++                raise
++            log.warning(
++                "database not ready, retrying",
++                extra={"fields": {"attempt": attempt, "error": type(exc).__name__}},
++            )
++            time.sleep(settings.db_retry_delay_s)
++
++
++def get_session(request: Request) -> Iterator[Session]:
++    factory: sessionmaker[Session] = request.app.state.session_factory
++    with factory() as session:
++        yield session
++
++
++SessionDep = Annotated[Session, Depends(get_session)]
+diff -ruN 02-crud/services/forecast/app/main.py 03-forecast/services/forecast/app/main.py
+--- 02-crud/services/forecast/app/main.py	2026-11-22 20:08:53
++++ 03-forecast/services/forecast/app/main.py	2026-11-22 20:15:19
+@@ -1,21 +1,45 @@
+ """App factory. Run with: uvicorn app.main:create_app --factory"""
+ 
+-from fastapi import FastAPI
++import logging
++from contextlib import asynccontextmanager
++
++import httpx
++from fastapi import FastAPI, Request
+ from fastapi.middleware.cors import CORSMiddleware
++from fastapi.responses import JSONResponse
++from sqlalchemy.exc import OperationalError
++from sqlalchemy.orm import sessionmaker
+ 
+ from app.config import Settings, load_settings
++from app.db import make_engine, prepare_database
+ from app.logging_setup import add_request_logging, configure_logging
+-from app.routers import health
++from app.routers import forecast, health
+ 
++log = logging.getLogger(__name__)
+ 
+-def create_app(settings: Settings | None = None) -> FastAPI:
++
++def create_app(settings: Settings | None = None, http: httpx.Client | None = None) -> FastAPI:
+     settings = settings or load_settings()
+     configure_logging(settings.service_name, settings.log_level)
++    engine = make_engine(settings.database_url)
+ 
+-    app = FastAPI(title="Sailing Planner Forecast Service", version=settings.version)
++    @asynccontextmanager
++    async def lifespan(app: FastAPI):
++        if settings.run_migrations:
++            prepare_database(settings, engine)
++        yield
++        app.state.http.close()
++        engine.dispose()
++
++    app = FastAPI(
++        title="Sailing Planner Forecast Service", version=settings.version, lifespan=lifespan
++    )
+     app.state.settings = settings
++    app.state.engine = engine
++    app.state.session_factory = sessionmaker(bind=engine, expire_on_commit=False)
++    app.state.http = http or httpx.Client(headers={"User-Agent": "sailing-planner/1.0"})
+ 
+-    # CORS restricted to the UI origin (brief §3a).
++    # CORS restricted to the UI origin (brief §3a). The UI calls /current directly.
+     app.add_middleware(
+         CORSMiddleware,
+         allow_origins=list(settings.cors_origins),
+@@ -24,5 +48,14 @@
+     )
+     add_request_logging(app)
+ 
++    @app.exception_handler(OperationalError)
++    async def database_unavailable(request: Request, exc: OperationalError):
++        log.warning("database unavailable", extra={"fields": {"error": type(exc).__name__}})
++        return JSONResponse(
++            status_code=503,
++            content={"detail": "Database unavailable, please retry in a few seconds."},
++        )
++
+     app.include_router(health.router)
++    app.include_router(forecast.router)
+     return app
+diff -ruN 02-crud/services/forecast/app/models.py 03-forecast/services/forecast/app/models.py
+--- 02-crud/services/forecast/app/models.py	1970-01-01 01:00:00
++++ 03-forecast/services/forecast/app/models.py	2026-11-22 20:15:19
+@@ -0,0 +1,25 @@
++"""ORM models. The schema itself is owned by the migrations in migrations/versions."""
++
++from datetime import UTC, datetime
++
++from sqlalchemy import DateTime, Integer, String, UnicodeText
++from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
++
++
++def utcnow() -> datetime:
++    return datetime.now(UTC).replace(tzinfo=None)
++
++
++class Base(DeclarativeBase):
++    pass
++
++
++class ForecastCacheEntry(Base):
++    """One cached upstream answer per (kind, rounded lat, rounded lon, days)."""
++
++    __tablename__ = "forecast_cache"
++
++    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
++    cache_key: Mapped[str] = mapped_column(String(100), unique=True)
++    payload: Mapped[str] = mapped_column(UnicodeText)
++    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+diff -ruN 02-crud/services/forecast/app/openmeteo.py 03-forecast/services/forecast/app/openmeteo.py
+--- 02-crud/services/forecast/app/openmeteo.py	1970-01-01 01:00:00
++++ 03-forecast/services/forecast/app/openmeteo.py	2026-11-22 20:15:19
+@@ -0,0 +1,133 @@
++"""Open-Meteo client: wind from the weather API, waves from the Marine API (no key needed).
++
++Every call has a hard timeout. Any failure becomes UpstreamError with a short, clear reason.
++"""
++
++import logging
++import time
++
++import httpx
++
++from app.config import Settings
++
++log = logging.getLogger("upstream")
++
++WIND_VARS = "wind_speed_10m,wind_gusts_10m,wind_direction_10m"
++WAVE_VARS = "wave_height,wave_direction,wave_period"
++
++
++class UpstreamError(Exception):
++    """Open-Meteo is down, slow, or answered with an error."""
++
++
++def _utc(t: str) -> str:
++    """Open-Meteo returns '2026-11-22T13:00' in the requested timezone (UTC)."""
++    return t if t.endswith("Z") else f"{t}Z"
++
++
++class OpenMeteoClient:
++    def __init__(self, http: httpx.Client, settings: Settings) -> None:
++        self.http = http
++        self.settings = settings
++
++    def _get(self, name: str, url: str, params: dict) -> dict:
++        start = time.perf_counter()
++        status = None
++        try:
++            response = self.http.get(url, params=params, timeout=self.settings.upstream_timeout_s)
++            status = response.status_code
++            response.raise_for_status()
++            data = response.json()
++            if not isinstance(data, dict) or data.get("error"):
++                raise UpstreamError(f"{name} returned an error: {data.get('reason', 'unknown')}")
++            return data
++        except httpx.TimeoutException as exc:
++            raise UpstreamError(
++                f"{name} did not answer within {self.settings.upstream_timeout_s:g}s"
++            ) from exc
++        except httpx.HTTPStatusError as exc:
++            raise UpstreamError(f"{name} answered HTTP {status}") from exc
++        except (httpx.HTTPError, ValueError) as exc:
++            raise UpstreamError(f"{name} is unreachable ({type(exc).__name__})") from exc
++        finally:
++            log.info(
++                "upstream call",
++                extra={
++                    "fields": {
++                        "upstream": name,
++                        "status": status,
++                        "duration_ms": round((time.perf_counter() - start) * 1000, 1),
++                    }
++                },
++            )
++
++    def _params(self, lat: float, lon: float, **extra) -> dict:
++        return {"latitude": lat, "longitude": lon, "timezone": "UTC", **extra}
++
++    def hourly(self, lat: float, lon: float, days: int) -> list[dict]:
++        weather = self._get(
++            "open-meteo-weather",
++            self.settings.weather_url,
++            self._params(lat, lon, hourly=WIND_VARS, wind_speed_unit="kn", forecast_days=days),
++        )
++        marine = self._get(
++            "open-meteo-marine",
++            self.settings.marine_url,
++            self._params(lat, lon, hourly=WAVE_VARS, forecast_days=days),
++        )
++        return merge_hourly(weather.get("hourly", {}), marine.get("hourly", {}))
++
++    def current(self, lat: float, lon: float) -> dict:
++        weather = self._get(
++            "open-meteo-weather",
++            self.settings.weather_url,
++            self._params(lat, lon, current=WIND_VARS, wind_speed_unit="kn"),
++        )
++        marine = self._get(
++            "open-meteo-marine",
++            self.settings.marine_url,
++            self._params(lat, lon, current=WAVE_VARS),
++        )
++        w, m = weather.get("current", {}), marine.get("current", {})
++        return {
++            "time": _utc(w.get("time") or m.get("time", "")),
++            "wind_kn": w.get("wind_speed_10m"),
++            "gust_kn": w.get("wind_gusts_10m"),
++            "wind_dir_deg": w.get("wind_direction_10m"),
++            "wave_m": m.get("wave_height"),
++            "wave_dir_deg": m.get("wave_direction"),
++            "wave_period_s": m.get("wave_period"),
++        }
++
++
++def merge_hourly(weather: dict, marine: dict) -> list[dict]:
++    """Join the two hourly series on time. Missing values stay None (e.g. waves on land)."""
++    waves = {
++        t: (h, d, p)
++        for t, h, d, p in zip(
++            marine.get("time", []),
++            marine.get("wave_height", []),
++            marine.get("wave_direction", []),
++            marine.get("wave_period", []),
++            strict=False,
++        )
++    }
++    hours = []
++    for i, t in enumerate(weather.get("time", [])):
++        wave_h, wave_d, wave_p = waves.get(t, (None, None, None))
++        hours.append(
++            {
++                "time": _utc(t),
++                "wind_kn": _at(weather.get("wind_speed_10m"), i),
++                "gust_kn": _at(weather.get("wind_gusts_10m"), i),
++                "wind_dir_deg": _at(weather.get("wind_direction_10m"), i),
++                "wave_m": wave_h,
++                "wave_dir_deg": wave_d,
++                "wave_period_s": wave_p,
++            }
++        )
++    return hours
++
++
++def _at(values: list | None, i: int):
++    return values[i] if values and i < len(values) else None
+diff -ruN 02-crud/services/forecast/app/routers/forecast.py 03-forecast/services/forecast/app/routers/forecast.py
+--- 02-crud/services/forecast/app/routers/forecast.py	1970-01-01 01:00:00
++++ 03-forecast/services/forecast/app/routers/forecast.py	2026-11-22 20:15:19
+@@ -0,0 +1,64 @@
++from typing import Annotated
++
++from fastapi import APIRouter, HTTPException, Query, Request
++
++from app import cache
++from app.db import SessionDep
++from app.openmeteo import OpenMeteoClient
++from app.service import ForecastUnavailable, cached_fetch
++
++router = APIRouter(tags=["forecast"])
++
++Lat = Annotated[float, Query(ge=-90, le=90, description="Latitude, decimal degrees")]
++Lon = Annotated[float, Query(ge=-180, le=180, description="Longitude, decimal degrees")]
++
++
++def _client(request: Request) -> OpenMeteoClient:
++    return OpenMeteoClient(request.app.state.http, request.app.state.settings)
++
++
++def _meta(lat: float, lon: float, status: str, age: float) -> dict:
++    return {
++        "latitude": round(lat, 2),
++        "longitude": round(lon, 2),
++        "source": "open-meteo",
++        "cache": status,
++        "age_s": round(age),
++        "stale": status == "stale",
++    }
++
++
++@router.get("/forecast")
++def forecast(
++    request: Request,
++    session: SessionDep,
++    lat: Lat,
++    lon: Lon,
++    days: Annotated[int, Query(ge=1, le=7)] = 3,
++):
++    """Hourly wind (kn), gusts (kn) and significant wave height (m), UTC."""
++    lat, lon = round(lat, 2), round(lon, 2)
++    settings = request.app.state.settings
++    key = cache.cache_key("forecast", lat, lon, days)
++    try:
++        hours, status, age = cached_fetch(
++            session, key, settings.forecast_ttl_s, lambda: _client(request).hourly(lat, lon, days)
++        )
++    except ForecastUnavailable as exc:
++        raise HTTPException(503, f"Forecast unavailable: {exc}") from exc
++    return {**_meta(lat, lon, status, age), "hours": hours}
++
++
++@router.get("/current")
++def current(request: Request, session: SessionDep, lat: Lat, lon: Lon):
++    """Current wind and sea state at a point."""
++    lat, lon = round(lat, 2), round(lon, 2)
++    settings = request.app.state.settings
++    key = cache.cache_key("current", lat, lon)
++    try:
++        now, status, age = cached_fetch(
++            session, key, settings.current_ttl_s, lambda: _client(request).current(lat, lon)
++        )
++    except ForecastUnavailable as exc:
++        raise HTTPException(503, f"Current conditions unavailable: {exc}") from exc
++    return {**_meta(lat, lon, status, age), "current": now}
+diff -ruN 02-crud/services/forecast/app/service.py 03-forecast/services/forecast/app/service.py
+--- 02-crud/services/forecast/app/service.py	1970-01-01 01:00:00
++++ 03-forecast/services/forecast/app/service.py	2026-11-22 20:15:19
+@@ -0,0 +1,39 @@
++"""Cache-first forecast lookups with graceful degradation.
++
++fresh cache -> serve it ("hit")
++otherwise   -> call Open-Meteo and store it ("miss")
++upstream down -> serve the last cached copy, marked stale ("stale")
++upstream down and nothing cached -> ForecastUnavailable (HTTP 503 with a clear message)
++"""
++
++import logging
++from collections.abc import Callable
++
++from sqlalchemy.orm import Session
++
++from app import cache
++from app.openmeteo import UpstreamError
++
++log = logging.getLogger(__name__)
++
++
++class ForecastUnavailable(Exception):
++    pass
++
++
++def cached_fetch(
++    session: Session, key: str, ttl_s: int, fetch: Callable[[], dict | list]
++) -> tuple[dict | list, str, float]:
++    """Return (data, cache_status, age_seconds)."""
++    hit = cache.get(session, key)
++    if hit and hit[1] <= ttl_s:
++        return hit[0]["data"], "hit", hit[1]
++    try:
++        data = fetch()
++    except UpstreamError as exc:
++        if hit:
++            log.warning("serving stale forecast", extra={"fields": {"reason": str(exc)}})
++            return hit[0]["data"], "stale", hit[1]
++        raise ForecastUnavailable(f"{exc}; no cached data for this location") from exc
++    cache.put(session, key, {"data": data})
++    return data, "miss", 0.0
+diff -ruN 02-crud/services/forecast/migrations/env.py 03-forecast/services/forecast/migrations/env.py
+--- 02-crud/services/forecast/migrations/env.py	1970-01-01 01:00:00
++++ 03-forecast/services/forecast/migrations/env.py	2026-11-22 20:15:19
+@@ -0,0 +1,29 @@
++"""Alembic environment. The app passes an open connection in config.attributes."""
++
++from alembic import context
++from sqlalchemy import engine_from_config, pool
++
++from app.config import database_url_from_env
++
++config = context.config
++
++
++def run() -> None:
++    connection = config.attributes.get("connection")
++    if connection is not None:
++        context.configure(connection=connection)
++        with context.begin_transaction():
++            context.run_migrations()
++        return
++    # CLI usage (alembic revision / upgrade) against DATABASE_URL or DB_* variables.
++    url = database_url_from_env()
++    engine = engine_from_config(
++        {"sqlalchemy.url": url}, prefix="sqlalchemy.", poolclass=pool.NullPool
++    )
++    with engine.connect() as conn:
++        context.configure(connection=conn)
++        with context.begin_transaction():
++            context.run_migrations()
++
++
++run()
+diff -ruN 02-crud/services/forecast/migrations/script.py.mako 03-forecast/services/forecast/migrations/script.py.mako
+--- 02-crud/services/forecast/migrations/script.py.mako	1970-01-01 01:00:00
++++ 03-forecast/services/forecast/migrations/script.py.mako	2026-11-22 20:15:19
+@@ -0,0 +1,22 @@
++"""${message}
++
++Revision ID: ${up_revision}
++Revises: ${down_revision | comma,n}
++Create Date: ${create_date}
++"""
++
++import sqlalchemy as sa
++from alembic import op
++
++revision = ${repr(up_revision)}
++down_revision = ${repr(down_revision)}
++branch_labels = None
++depends_on = None
++
++
++def upgrade() -> None:
++    ${upgrades if upgrades else "pass"}
++
++
++def downgrade() -> None:
++    ${downgrades if downgrades else "pass"}
+diff -ruN 02-crud/services/forecast/migrations/versions/0001_forecast_cache.py 03-forecast/services/forecast/migrations/versions/0001_forecast_cache.py
+--- 02-crud/services/forecast/migrations/versions/0001_forecast_cache.py	1970-01-01 01:00:00
++++ 03-forecast/services/forecast/migrations/versions/0001_forecast_cache.py	2026-11-22 20:15:19
+@@ -0,0 +1,30 @@
++"""Create forecast_cache.
++
++Revision ID: 0001
++Revises:
++Create Date: 2026-11-22
++"""
++
++import sqlalchemy as sa
++from alembic import op
++
++revision = "0001"
++down_revision = None
++branch_labels = None
++depends_on = None
++
++
++def upgrade() -> None:
++    op.create_table(
++        "forecast_cache",
++        sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
++        sa.Column("cache_key", sa.String(100), nullable=False),
++        sa.Column("payload", sa.UnicodeText, nullable=False),
++        sa.Column("fetched_at", sa.DateTime, nullable=False),
++    )
++    op.create_index("ux_forecast_cache_key", "forecast_cache", ["cache_key"], unique=True)
++
++
++def downgrade() -> None:
++    op.drop_index("ux_forecast_cache_key", table_name="forecast_cache")
++    op.drop_table("forecast_cache")
+diff -ruN 02-crud/services/forecast/requirements.in 03-forecast/services/forecast/requirements.in
+--- 02-crud/services/forecast/requirements.in	2026-11-22 20:08:53
++++ 03-forecast/services/forecast/requirements.in	2026-11-22 20:15:19
+@@ -1,3 +1,6 @@
+ fastapi
+ uvicorn
+ httpx
++sqlalchemy
++alembic
++pyodbc
+diff -ruN 02-crud/services/forecast/requirements.txt 03-forecast/services/forecast/requirements.txt
+--- 02-crud/services/forecast/requirements.txt	2026-11-22 20:08:53
++++ 03-forecast/services/forecast/requirements.txt	2026-11-22 20:15:19
+@@ -1,6 +1,8 @@
+ # Pinned runtime dependencies. Regenerate with:
+ #   uv pip compile requirements.in --python-version 3.12 -o requirements.txt
+ annotated-doc==0.0.5
++alembic==1.20.1
++annotated-doc==0.0.5
+ annotated-types==0.8.0
+ anyio==4.16.0
+ certifi==2026.10.23
+@@ -10,9 +12,13 @@
+ httpcore==1.0.9
+ httpx==0.28.1
+ idna==3.20
++mako==1.4.3
++markupsafe==3.0.4
+ opentelemetry-api==1.45.2
+ pydantic==2.14.3
+ pydantic-core==2.50.4
++pyodbc==5.5.0
++sqlalchemy==2.1.8
+ starlette==1.10.0
+ typing-extensions==4.16.0
+ typing-inspection==0.4.5
+diff -ruN 02-crud/services/forecast/tests/conftest.py 03-forecast/services/forecast/tests/conftest.py
+--- 02-crud/services/forecast/tests/conftest.py	2026-11-22 20:08:53
++++ 03-forecast/services/forecast/tests/conftest.py	2026-11-22 20:15:50
+@@ -1,16 +1,79 @@
++import httpx
+ import pytest
+ from fastapi.testclient import TestClient
+ 
+ from app.config import Settings
+ from app.main import create_app
+ 
++TIMES = ["2026-11-22T00:00", "2026-11-22T01:00", "2026-11-22T02:00"]
++WEATHER = {
++    "hourly": {
++        "time": TIMES,
++        "wind_speed_10m": [10.0, 12.5, 15.0],
++        "wind_gusts_10m": [14.0, 18.0, 22.0],
++        "wind_direction_10m": [270, 280, 290],
++    },
++    "current": {
++        "time": "2026-11-22T01:15",
++        "wind_speed_10m": 11.0,
++        "wind_gusts_10m": 16.0,
++        "wind_direction_10m": 275,
++    },
++}
++MARINE = {
++    "hourly": {
++        "time": TIMES,
++        "wave_height": [0.8, 1.1, None],
++        "wave_direction": [250, 255, None],
++        "wave_period": [5.0, 5.5, None],
++    },
++    "current": {
++        "time": "2026-11-22T01:15",
++        "wave_height": 0.9,
++        "wave_direction": 252,
++        "wave_period": 5.2,
++    },
++}
+ 
++
++class FakeOpenMeteo:
++    """Programmable stand-in for both Open-Meteo APIs."""
++
++    def __init__(self) -> None:
++        self.calls: list[httpx.Request] = []
++        self.mode = "ok"  # ok | timeout | http500 | error_json | down
++
++    def __call__(self, request: httpx.Request) -> httpx.Response:
++        self.calls.append(request)
++        if self.mode == "timeout":
++            raise httpx.ReadTimeout("timed out", request=request)
++        if self.mode == "down":
++            raise httpx.ConnectError("connection refused", request=request)
++        if self.mode == "http500":
++            return httpx.Response(500, json={"error": True})
++        if self.mode == "error_json":
++            return httpx.Response(200, json={"error": True, "reason": "Latitude out of range"})
++        body = MARINE if "marine" in request.url.host else WEATHER
++        return httpx.Response(200, json=body)
++
++
+ @pytest.fixture
+-def settings() -> Settings:
+-    return Settings(version="test", cors_origins=("http://ui.test",))
++def upstream() -> FakeOpenMeteo:
++    return FakeOpenMeteo()
+ 
+ 
+ @pytest.fixture
+-def client(settings):
+-    with TestClient(create_app(settings)) as c:
++def settings(tmp_path) -> Settings:
++    return Settings(
++        version="test",
++        cors_origins=("http://ui.test",),
++        database_url=f"sqlite:///{tmp_path / 'test.db'}",
++        db_connect_retries=1,
++    )
++
++
++@pytest.fixture
++def client(settings, upstream):
++    http = httpx.Client(transport=httpx.MockTransport(upstream))
++    with TestClient(create_app(settings, http=http)) as c:
+         yield c
+diff -ruN 02-crud/services/forecast/tests/test_db.py 03-forecast/services/forecast/tests/test_db.py
+--- 02-crud/services/forecast/tests/test_db.py	1970-01-01 01:00:00
++++ 03-forecast/services/forecast/tests/test_db.py	2026-11-22 20:15:50
+@@ -0,0 +1,62 @@
++import pytest
++from sqlalchemy import inspect
++from sqlalchemy.exc import OperationalError
++
++from app import db
++from app.config import Settings, database_url_from_env
++
++
++def test_migrations_create_tables(client):
++    tables = set(inspect(client.app.state.engine).get_table_names())
++    assert {"forecast_cache", "alembic_version"} <= tables
++
++
++def test_migrations_are_idempotent(client):
++    db.run_migrations(client.app.state.engine)  # second run is a no-op
++
++
++def test_prepare_database_retries_then_raises(monkeypatch):
++    calls = []
++
++    def boom(engine):
++        calls.append(1)
++        raise OperationalError("SELECT 1", {}, Exception("paused"))
++
++    monkeypatch.setattr(db, "run_migrations", boom)
++    settings = Settings(db_connect_retries=3, db_retry_delay_s=0)
++    with pytest.raises(OperationalError):
++        db.prepare_database(settings, engine=None)
++    assert len(calls) == 3
++
++
++def test_database_error_returns_503_not_500(client, monkeypatch):
++    def broken(*args, **kwargs):
++        raise OperationalError("SELECT 1", {}, Exception("database paused"))
++
++    monkeypatch.setattr("sqlalchemy.orm.Session.scalar", broken)
++    response = client.get("/forecast", params={"lat": 1, "lon": 1})
++    assert response.status_code == 503
++    assert "Database unavailable" in response.json()["detail"]
++
++
++def test_database_url_from_env(monkeypatch):
++    monkeypatch.delenv("DATABASE_URL", raising=False)
++    monkeypatch.delenv("DB_HOST", raising=False)
++    assert str(database_url_from_env()).startswith("sqlite")
++
++    monkeypatch.setenv("DB_HOST", "sql.example.net")
++    monkeypatch.setenv("DB_NAME", "fcdb")
++    monkeypatch.setenv("DB_USER", "u")
++    monkeypatch.setenv("DB_PASSWORD", "p@ss;word")
++    url = database_url_from_env()
++    assert url.drivername == "mssql+pyodbc"
++    assert url.database == "fcdb"
++    assert url.password == "p@ss;word"
++    assert url.query["TrustServerCertificate"] == "no"
++
++    monkeypatch.setenv("DATABASE_URL", "sqlite:///x.db")
++    assert database_url_from_env() == "sqlite:///x.db"
++
++
++def test_create_database_if_missing_ignores_sqlite():
++    db.create_database_if_missing("sqlite:///:memory:")  # no-op, must not raise
+diff -ruN 02-crud/services/forecast/tests/test_forecast.py 03-forecast/services/forecast/tests/test_forecast.py
+--- 02-crud/services/forecast/tests/test_forecast.py	1970-01-01 01:00:00
++++ 03-forecast/services/forecast/tests/test_forecast.py	2026-11-22 20:15:50
+@@ -0,0 +1,146 @@
++import dataclasses
++import logging
++
++import httpx
++from fastapi.testclient import TestClient
++
++from app import cache
++from app.main import create_app
++from app.openmeteo import merge_hourly
++
++
++def test_forecast_merges_wind_and_waves(client):
++    response = client.get("/forecast", params={"lat": 41.38, "lon": 2.18})
++    assert response.status_code == 200
++    body = response.json()
++    assert body["source"] == "open-meteo"
++    assert body["cache"] == "miss"
++    assert body["stale"] is False
++    assert len(body["hours"]) == 3
++    first = body["hours"][0]
++    assert first == {
++        "time": "2026-11-22T00:00Z",
++        "wind_kn": 10.0,
++        "gust_kn": 14.0,
++        "wind_dir_deg": 270,
++        "wave_m": 0.8,
++        "wave_dir_deg": 250,
++        "wave_period_s": 5.0,
++    }
++    assert body["hours"][2]["wave_m"] is None  # missing upstream value stays None
++
++
++def test_forecast_requests_knots_utc_and_days(client, upstream):
++    client.get("/forecast", params={"lat": 41.38, "lon": 2.18, "days": 2})
++    weather = next(r for r in upstream.calls if "marine" not in r.url.host)
++    assert weather.url.params["wind_speed_unit"] == "kn"
++    assert weather.url.params["timezone"] == "UTC"
++    assert weather.url.params["forecast_days"] == "2"
++
++
++def test_second_call_is_served_from_cache(client, upstream):
++    client.get("/forecast", params={"lat": 41.38, "lon": 2.18})
++    calls = len(upstream.calls)
++    response = client.get("/forecast", params={"lat": 41.381, "lon": 2.182})  # same 2-dp cell
++    assert response.json()["cache"] == "hit"
++    assert len(upstream.calls) == calls
++
++
++def test_upstream_timeout_without_cache_is_a_clear_503(client, upstream):
++    upstream.mode = "timeout"
++    response = client.get("/forecast", params={"lat": 41.38, "lon": 2.18})
++    assert response.status_code == 503
++    detail = response.json()["detail"]
++    assert "did not answer within 4s" in detail
++    assert "no cached data" in detail
++
++
++def test_upstream_http_error_is_a_clear_503(client, upstream):
++    upstream.mode = "http500"
++    response = client.get("/current", params={"lat": 41.38, "lon": 2.18})
++    assert response.status_code == 503
++    assert "answered HTTP 500" in response.json()["detail"]
++
++
++def test_upstream_error_payload_is_a_clear_503(client, upstream):
++    upstream.mode = "error_json"
++    response = client.get("/forecast", params={"lat": 41.38, "lon": 2.18})
++    assert response.status_code == 503
++    assert "Latitude out of range" in response.json()["detail"]
++
++
++def test_upstream_unreachable_is_a_clear_503(client, upstream):
++    upstream.mode = "down"
++    response = client.get("/forecast", params={"lat": 41.38, "lon": 2.18})
++    assert response.status_code == 503
++    assert "unreachable" in response.json()["detail"]
++
++
++def test_stale_cache_is_served_when_upstream_fails(settings, upstream):
++    expired = dataclasses.replace(settings, forecast_ttl_s=0)
++    http = httpx.Client(transport=httpx.MockTransport(upstream))
++    with TestClient(create_app(expired, http=http)) as client:
++        assert client.get("/forecast", params={"lat": 41.38, "lon": 2.18}).status_code == 200
++        upstream.mode = "timeout"
++        response = client.get("/forecast", params={"lat": 41.38, "lon": 2.18})
++    assert response.status_code == 200
++    assert response.json()["cache"] == "stale"
++    assert response.json()["stale"] is True
++    assert len(response.json()["hours"]) == 3
++
++
++def test_current_conditions(client):
++    response = client.get("/current", params={"lat": 41.38, "lon": 2.18})
++    assert response.status_code == 200
++    assert response.json()["current"] == {
++        "time": "2026-11-22T01:15Z",
++        "wind_kn": 11.0,
++        "gust_kn": 16.0,
++        "wind_dir_deg": 275,
++        "wave_m": 0.9,
++        "wave_dir_deg": 252,
++        "wave_period_s": 5.2,
++    }
++
++
++def test_invalid_coordinates_are_rejected(client):
++    assert client.get("/forecast", params={"lat": 91, "lon": 0}).status_code == 422
++    assert client.get("/forecast", params={"lat": 0, "lon": 181}).status_code == 422
++    assert client.get("/forecast", params={"lat": 0, "lon": 0, "days": 8}).status_code == 422
++    assert client.get("/current", params={"lat": 0}).status_code == 422
++
++
++def test_upstream_calls_are_logged(client, caplog):
++    with caplog.at_level(logging.INFO, logger="upstream"):
++        client.get("/current", params={"lat": 41.38, "lon": 2.18})
++    names = [r.fields["upstream"] for r in caplog.records if r.name == "upstream"]
++    assert names == ["open-meteo-weather", "open-meteo-marine"]
++
++
++def test_merge_handles_missing_series():
++    hours = merge_hourly({"time": ["2026-11-22T00:00"], "wind_speed_10m": [5.0]}, {})
++    assert hours == [
++        {
++            "time": "2026-11-22T00:00Z",
++            "wind_kn": 5.0,
++            "gust_kn": None,
++            "wind_dir_deg": None,
++            "wave_m": None,
++            "wave_dir_deg": None,
++            "wave_period_s": None,
++        }
++    ]
++
++
++def test_cache_key_rounds_and_includes_days():
++    assert cache.cache_key("forecast", 41.3812, 2.1789, 3) == "forecast:41.38:2.18:3"
++    assert cache.cache_key("current", -1.0, 0.0) == "current:-1.00:0.00"
++
++
++def test_cache_put_overwrites(client):
++    with client.app.state.session_factory() as session:
++        cache.put(session, "k", {"data": 1})
++        cache.put(session, "k", {"data": 2})
++        payload, age = cache.get(session, "k")
++    assert payload == {"data": 2}
++    assert age >= 0

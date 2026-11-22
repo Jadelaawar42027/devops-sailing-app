@@ -1,0 +1,493 @@
+diff -ruN 08-smoke-blue-green/.github/pull_request_template.md 09-docs/.github/pull_request_template.md
+--- 08-smoke-blue-green/.github/pull_request_template.md	1970-01-01 01:00:00
++++ 09-docs/.github/pull_request_template.md	2026-11-22 20:34:04
+@@ -0,0 +1,16 @@
++## What and why
++
++<!-- One or two sentences. Link the GitHub Project item. -->
++
++## How to check it
++
++<!-- Commands or clicks for the reviewer. -->
++
++## Definition of Done
++
++- [ ] Reviewed and approved by another team member
++- [ ] CI green
++- [ ] Tests added or updated
++- [ ] No secrets in code, logs or history
++- [ ] Docs / AI_USAGE.md updated if needed
++- [ ] After merge: CD run green (deployed)
+diff -ruN 08-smoke-blue-green/README.md 09-docs/README.md
+--- 08-smoke-blue-green/README.md	2026-11-22 20:08:13
++++ 09-docs/README.md	2026-11-22 20:33:39
+@@ -1,3 +1,122 @@
+ # Sailing Passage Go/No-Go Planner
+ 
+-IE DevOps group assignment. Work in progress: see the open pull requests.
++<!-- TODO(team): README wording -->
++
++Save a boat with the wind, gust and wave limits it can safely sail in, and a passage (start, end,
++planned speed). The planner pulls the marine forecast from Open-Meteo and shows every hourly
++departure in the next three days as **GO** or **NO-GO**, with the reason: which limit failed, by
++how much, and when.
++
++**Live:** UI `TODO(team): https://<sdd-3a-gN-ui>.azurestaticapps.net` ·
++API `TODO(team): https://<sdd-3a-gN-api>.<env>.azurecontainerapps.io/docs` ·
++Forecast `TODO(team): https://<sdd-3a-gN-forecast>.<env>.azurecontainerapps.io/docs`
++
++## Architecture
++
++```mermaid
++flowchart LR
++  user([Browser]) -->|static files| swa["Static Web App<br/>sdd-3a-gN-ui<br/>HTML/JS"]
++  user -->|"HTTPS, CORS: UI origin only<br/>/boats /passages /passages/{id}/windows"| api
++  user -->|"HTTPS /current"| fc
++
++  subgraph aca["Container Apps environment sdd-3a-gN-env (Consumption, 0-1 replica each)"]
++    api["API service<br/>sdd-3a-gN-api<br/>FastAPI: CRUD + scoring"]
++    fc["Forecast service<br/>sdd-3a-gN-forecast<br/>FastAPI: Open-Meteo proxy + cache"]
++  end
++
++  api -->|"HTTP /forecast, 10 s timeout"| fc
++  fc -->|"HTTPS, 4 s timeout"| om[(Open-Meteo<br/>weather + marine)]
++  api --> apidb[("Azure SQL serverless<br/>sdd-3a-gN-api-db<br/>boats, passages")]
++  fc --> fcdb[("Azure SQL serverless<br/>sdd-3a-gN-forecast-db<br/>forecast_cache")]
++  aca -.->|stdout JSON logs| law[("Log Analytics<br/>sdd-3a-gN-logs<br/>dashboard + SLO queries")]
++
++  gh["GitHub Actions"] -->|"SHA-tagged images"| ghcr[(GHCR)]
++  ghcr --> aca
++  gh -->|"OIDC login, Bicep, SWA upload"| aca
++```
++
++Two services, each with its own container and database, talking over HTTP (brief §3a). Why this
++split: [docs/decisions.md](docs/decisions.md). Data model: [docs/data-model.md](docs/data-model.md).
++
++| Path | What |
++| --- | --- |
++| `services/api` | Boats and passages CRUD, `GET /passages/{id}/windows` (scoring in `app/scoring.py`) |
++| `services/forecast` | `GET /forecast` and `GET /current` from Open-Meteo, cached in its own database |
++| `ui/` | Static UI: planner (timeline + current conditions), passages, boats |
++| `infra/` | Bicep for every Azure resource |
++| `.github/workflows` | `ci.yml` (every PR and push), `cd.yml` (merge to main) |
++| `scripts/` | Smoke tests, demo traffic, partial-failure test, blue-green |
++| `docs/` | Decisions, data model, monitoring + SLO, Azure setup, Scrum |
++
++## Run locally
++
++Needs Docker. From a clean clone:
++
++```bash
++docker compose up --build
++```
++
++| | |
++| --- | --- |
++| UI | http://localhost:8090 |
++| API + Swagger | http://localhost:8010/docs |
++| Forecast + Swagger | http://localhost:8011/docs |
++
++SQL Server runs in compose with one database per service; migrations run when each service starts.
++The first start takes a minute while SQL Server initialises. On Apple Silicon, Docker Desktop needs
++Rosetta enabled (Settings → General) for the SQL Server image.
++
++Add a boat, then a passage, then open the planner. To fill the dashboard with data:
++`scripts/traffic.sh`.
++
++## Tests
++
++```bash
++cd services/api        # or services/forecast
++python3.12 -m venv .venv && . .venv/bin/activate
++pip install -r requirements.txt -r requirements-dev.txt
++ruff check . && ruff format --check .
++pytest --cov=app        # CI fails below 70% coverage
++```
++
++UI: `npx prettier@3.3.3 --check ui`. Tests never touch Azure; they use SQLite and fake HTTP backends.
++
++| Test | Command |
++| --- | --- |
++| Unit + API tests | `pytest` in each service |
++| Scoring fixtures and edge cases | `services/api/tests/test_scoring.py` |
++| Partial failure (service down / Open-Meteo down) | `scripts/partial-failure.sh` and `scripts/partial-failure.sh upstream`, see [docs/partial-failure.md](docs/partial-failure.md) |
++| End-to-end against a running system | `API_URL=... UI_URL=... scripts/smoke-e2e.sh` |
++
++## How deploy works
++
++- **CI** (`.github/workflows/ci.yml`, every PR and push): ruff lint, ruff format check, pytest
++  with coverage (fail under 70%), pip-audit (report only), Prettier check of the UI, Docker image
++  build of both services.
++- **CD** (`.github/workflows/cd.yml`, merge to `main`): runs CI, pushes `ghcr.io/<owner>/<repo>/{api,forecast}:<commit sha>`,
++  logs in to Azure with OIDC (no stored credentials), applies `infra/main.bicep` with the new
++  images (migrations run on startup), uploads the UI to Static Web Apps with the service URLs
++  written into `ui/config.js`, then fails the run unless `/health` answers 200 on all three and the
++  end-to-end smoke test passes.
++- **Blue-green** (optional, GitHub variable `DEPLOY_STRATEGY=bluegreen`): new revisions are
++  tested on a `green` label URL at 0% traffic before traffic moves (`scripts/bluegreen.sh`).
++
++Reproduce the Azure setup: [docs/azure-setup.md](docs/azure-setup.md).
++
++## Monitoring
++
++Structured JSON request logs → Log Analytics. Dashboard queries, the SLO (99% of windows requests
++under 1 s over 1 h) and how to pin them: [docs/monitoring/](docs/monitoring/README.md).
++
++## Team
++
++<!-- TODO(team): fill in names and GitHub usernames. Roles rotate each sprint: see docs/scrum/. -->
++
++| Name | GitHub | Main areas |
++| --- | --- | --- |
++| TODO | TODO | TODO |
++| TODO | TODO | TODO |
++| TODO | TODO | TODO |
++
++Scrum: [Definition of Done](docs/scrum/definition-of-done.md), sprint notes in [docs/scrum/](docs/scrum/).
++AI use: [AI_USAGE.md](AI_USAGE.md).
+diff -ruN 08-smoke-blue-green/docs/data-model.md 09-docs/docs/data-model.md
+--- 08-smoke-blue-green/docs/data-model.md	1970-01-01 01:00:00
++++ 09-docs/docs/data-model.md	2026-11-22 20:33:39
+@@ -0,0 +1,61 @@
++# Data model
++
++Two databases, one per service (brief §3a). The schema is owned by the Alembic migrations, which
++run on each service's startup:
++`services/api/migrations/versions/0001_boats_and_passages.py` and
++`services/forecast/migrations/versions/0001_forecast_cache.py`.
++
++## API database (`sdd-3a-g<N>-api-db`)
++
++```mermaid
++erDiagram
++  BOATS ||--o{ PASSAGES : "sails"
++  BOATS {
++    int id PK
++    nvarchar(100) name
++    float max_wind_kn "sustained wind limit, knots"
++    float max_gust_kn "nullable: gusts not checked"
++    float max_wave_m "significant wave height limit, metres"
++    datetime created_at
++    datetime updated_at
++  }
++  PASSAGES {
++    int id PK
++    int boat_id FK "indexed"
++    nvarchar(100) name
++    float start_lat
++    float start_lon
++    float end_lat
++    float end_lon
++    float speed_kn "planned average speed"
++    datetime created_at
++    datetime updated_at
++  }
++```
++
++- A boat has many passages; a passage belongs to exactly one boat.
++- Deleting a boat that still has passages is refused with `409 Conflict`.
++- Validation (Pydantic, `app/schemas.py`): names 1–100 characters; wind 0–80 kn; gust 0–100 kn and not
++  below the wind limit; waves 0–15 m; latitude ±90; longitude ±180; speed 0–40 kn.
++- Times are stored in UTC.
++
++## Forecast database (`sdd-3a-g<N>-forecast-db`)
++
++```mermaid
++erDiagram
++  FORECAST_CACHE {
++    int id PK
++    varchar(100) cache_key UK "kind:lat:lon[:days], coordinates rounded to 0.01 degree"
++    nvarchar(max) payload "JSON: merged hourly series or current conditions"
++    datetime fetched_at "UTC; fresh for 30 min (forecast) or 10 min (current)"
++  }
++```
++
++- No relationship to the API database: the services share data only over HTTP.
++- Rows older than 7 days are deleted on write. Expired rows are still used as a stale fallback when
++  Open-Meteo is down.
++
++## Computed, not stored
++
++The departure windows (`GET /passages/{id}/windows`) are calculated on every request from a passage,
++its boat and the forecast. They are not persisted, so they are never out of date.
+diff -ruN 08-smoke-blue-green/docs/decisions.md 09-docs/docs/decisions.md
+--- 08-smoke-blue-green/docs/decisions.md	1970-01-01 01:00:00
++++ 09-docs/docs/decisions.md	2026-11-22 20:33:39
+@@ -0,0 +1,123 @@
++# Decision records
++
++Short records (context, decision, alternatives, consequences), as asked in brief §3b and §7.
++
++## 1. Architecture: an API service and a forecast service
++
++**Context.** The brief requires exactly two services, each with its own container and database,
++talking over HTTP, and a static UI calling them from the browser. The product has two different
++kinds of work: user data (boats, passages) and an external, slow, sometimes failing data source
++(the marine forecast).
++
++**Decision.** `api` owns boats, passages and the GO/NO-GO scoring. `forecast` owns everything about
++Open-Meteo: the two upstream calls (wind from the weather API, waves from the Marine API), merging
++them, caching them and failing cleanly. The API calls the forecast service with a 10 s timeout. The
++UI calls the API for everything and the forecast service directly for the current-conditions panel.
++Inside each service we use a simple layered structure: routers (HTTP), a pure domain module
++(`scoring.py`, `openmeteo.py`), and data access (`db.py`, `models.py`, migrations).
++
++**Alternatives.** Splitting boats and passages into two services: they are one aggregate and would
++need a cross-service join for every windows request. Putting scoring in the forecast service: it
++would then need the boats, which belong to the API.
++
++**Consequences.** The external dependency is isolated: when Open-Meteo or the forecast service
++fails, CRUD keeps working and only the windows flow degrades (see `docs/partial-failure.md`). The
++cost is an extra network hop per windows request, which the cache keeps cheap.
++
++## 2. Storage: Azure SQL serverless, SQLAlchemy and Alembic
++
++**Context.** The stack is fixed: one serverless Azure SQL database per service, SQL Server in compose
++locally, never the Azure database from CI, and a schema defined by versioned migrations applied on
++startup.
++
++**Decision.** SQLAlchemy 2 ORM with `pyodbc` (ODBC Driver 18) and Alembic migrations in
++`services/*/migrations/versions`, run in each service's startup with retries (Azure SQL serverless
++can take up to a minute to resume after auto-pause). The forecast service's database holds a
++`forecast_cache` table keyed by rounded coordinates. Tests run the same migrations on SQLite.
++Local compose runs one SQL Server container that hosts both services' databases.
++
++**Alternatives.** Hand-written T-SQL migration files: simpler, but not runnable on SQLite, so tests
++would need SQL Server in CI. An in-memory cache in the forecast service: lost on every scale to
++zero, so the cache would almost never be warm.
++
++**Consequences.** Migrations are tested on every PR. Migrations must stay additive so a new revision
++can migrate while the old one serves (needed for blue-green). Deleting a boat that still has
++passages returns 409 instead of cascading, so data is never removed by accident.
++
++## 3. Deployment and pipeline: GHCR, Bicep applied by CD, OIDC
++
++**Context.** Brief §4 and §5: images in GHCR, Container Apps scaling to zero, one Static Web App,
++nothing changed by hand after setup, deploy only if CI passed, and a failing `/health` must fail
++the run. IaC is credited.
++
++**Decision.** `cd.yml` calls `ci.yml` as its first job, pushes images tagged with the commit SHA,
++then applies `infra/main.bicep` with those tags on every merge. Bicep declares every resource,
++including the dashboard queries, so the deployed state is always the repository's state. Azure login
++uses OpenID Connect with the group's identity: no client secret or credentials JSON exists anywhere.
++The only secrets are `SQL_ADMIN_PASSWORD` (and optionally `GHCR_PULL_TOKEN`) as GitHub secrets,
++passed into Container Apps secrets. The UI gets the service URLs through a `config.js` written at
++deploy time. After deploying, `scripts/smoke-health.sh` waits up to 5 minutes for `/health` (cold
++start and database resume) and checks the deployed version, then `scripts/smoke-e2e.sh` runs an
++end-to-end test against the live URL.
++
++**Alternatives.** Imperative `az containerapp update` calls: faster but drifts from the declared
++infrastructure. A publish profile or service-principal secret: a long-lived credential that can leak.
++
++**Consequences.** The first deploy creates everything (~10 min); later ones are incremental.
++Blue-green (credited extra) is available behind `DEPLOY_STRATEGY=bluegreen`: new revisions are
++tested on a label URL at 0% traffic before switching. It is off by default so the simple path can
++be proven first.
++
++## 4. Monitoring: Log Analytics only, structured logs, one SLO
++
++**Context.** Brief §4 and §6: use the Log Analytics workspace of the Container Apps environment, no
++other Azure services, low log volume; a dashboard with request count, error rate and response time;
++one SLO with its query.
++
++**Decision.** Each service writes one JSON line per request (method, path, route template, status,
++duration) and one per upstream call. KQL queries in `docs/monitoring/queries` parse them; Bicep
++deploys them as saved searches; the dashboard pins them. The SLO is on the journey users care about
++and that crosses everything: 99% of `GET /passages/{id}/windows` answer below 500 and under 1 s over
++1 h. Degraded 503 answers count against it.
++
++**Alternatives.** Application Insights with OpenTelemetry: richer traces, but an extra Azure service
++the brief rules out.
++
++**Consequences.** No distributed tracing; the `route` field and the upstream log lines are enough to
++find which hop is slow. Scale to zero means cold starts count against the SLO; the team accepts that
++for cost (see `docs/monitoring/slo.md`).
++
++## 5. The feature beyond CRUD: GO/NO-GO scoring
++
++**Context.** A sailor wants to know when to leave, not to read a forecast table.
++
++**Decision.** `app/scoring.py` is a pure function (no I/O, no clock). Passage duration = great-circle
++distance ÷ planned speed. For each hourly departure in the forecast, the passage is GO only if every
++forecast hour from departure up to the first hour at or after arrival is within the boat's limits
++for wind, gusts (if set) and significant wave height. The forecast is taken at the start and the end
++point and the worst value of the two wins. Exactly at the limit is GO; a `SAFETY_MARGIN` constant can
++make it stricter. Missing data is NO-GO. Every NO-GO lists each failed limit with the observed value,
++the limit, the amount over and the time, worst first. Departures in the past and passages that end
++beyond the forecast are left out.
++
++**Alternatives.** Sampling the route at intermediate points: more accurate, but more upstream calls
++for a small gain on short passages. A score from 0 to 100: harder to explain and to trust than
++"which limit, by how much".
++
++**Consequences.** Fully unit-tested with fixtures (`tests/test_scoring.py`). Conservative on long
++passages, because the worst of start and end is applied to every hour.
++
++## 6. Language, framework and frontend
++
++**Context.** Allowed: Python (Flask or FastAPI) or Node (Express); a static frontend.
++
++**Decision.** Python 3.12 and FastAPI for both services: request validation with Pydantic gives
++clear 422 messages for free, and both services share the same tooling (ruff, pytest, pip-audit).
++The UI is plain HTML, CSS and ES modules with no build step: three pages, a small `api.js` wrapper
++with a 15 s timeout, and no HTML built from server data (XSS-safe by construction).
++
++**Alternatives.** React or Vue built to static files: more tooling for three simple pages.
++
++**Consequences.** No frontend build to break in CI; Prettier and `node --check` are the UI's gate.
++Shared code between the services (logging, DB setup) is duplicated on purpose so each service builds
++from its own folder.
+diff -ruN 08-smoke-blue-green/docs/scrum/definition-of-done.md 09-docs/docs/scrum/definition-of-done.md
+--- 08-smoke-blue-green/docs/scrum/definition-of-done.md	1970-01-01 01:00:00
++++ 09-docs/docs/scrum/definition-of-done.md	2026-11-22 20:34:04
+@@ -0,0 +1,15 @@
++# Definition of Done
++
++Applied to every backlog item (brief §2). An item is **Done** only when all of these are true:
++
++1. **Merged to `main` through a pull request reviewed and approved by another team member.**
++   No direct pushes to `main` (branch protection is on).
++2. **CI is green** on the pull request: lint, format check, tests with coverage at or above 70%,
++   image build.
++3. **Deployed**: the CD run for the merge commit finished green, so the change is live on Azure and
++   `/health` plus the end-to-end smoke test passed against it.
++4. The acceptance criteria of the user story are met and were checked on the deployed app.
++5. New or changed behaviour has tests (unit or API level); bugs get a test that failed before the fix.
++6. No secrets, keys or passwords in the code, the history, the images or the logs.
++7. Docs updated where the change affects them (README, decisions, data model, monitoring).
++8. AI-assisted work is logged in `AI_USAGE.md`, and the author can explain every line of it.
+diff -ruN 08-smoke-blue-green/docs/scrum/sprint-0.md 09-docs/docs/scrum/sprint-0.md
+--- 08-smoke-blue-green/docs/scrum/sprint-0.md	1970-01-01 01:00:00
++++ 09-docs/docs/scrum/sprint-0.md	2026-11-22 20:34:04
+@@ -0,0 +1,41 @@
++# Sprint 0 (4–10 Nov)
++
++<!-- TODO(team): fill in from the real Planning, Review and Retrospective. Do not invent anything. -->
++
++Brief's goal for this sprint: Team, roles, product idea, initial backlog, repository, Definition of Done, local skeleton.
++
++## Roles
++
++| Role | Member |
++| --- | --- |
++| Product Owner | TODO |
++| Scrum Master | TODO |
++| Developers | everyone |
++
++## Sprint Goal
++
++TODO
++
++## Items selected at Planning
++
++Link the GitHub Project items.
++
++| Item | Owner | Done? |
++| --- | --- | --- |
++| TODO | TODO | TODO |
++
++## Done
++
++TODO
++
++## Not done (and why)
++
++TODO
++
++## Review: feedback received
++
++TODO
++
++## Retrospective agreements
++
++TODO
+diff -ruN 08-smoke-blue-green/docs/scrum/sprint-1.md 09-docs/docs/scrum/sprint-1.md
+--- 08-smoke-blue-green/docs/scrum/sprint-1.md	1970-01-01 01:00:00
++++ 09-docs/docs/scrum/sprint-1.md	2026-11-22 20:34:04
+@@ -0,0 +1,41 @@
++# Sprint 1 (11–18 Nov)
++
++<!-- TODO(team): fill in from the real Planning, Review and Retrospective. Do not invent anything. -->
++
++Brief's goal for this sprint: Skeleton deployed to Azure by the pipeline, then the first core feature end to end.
++
++## Roles
++
++| Role | Member |
++| --- | --- |
++| Product Owner | TODO |
++| Scrum Master | TODO |
++| Developers | everyone |
++
++## Sprint Goal
++
++TODO
++
++## Items selected at Planning
++
++Link the GitHub Project items.
++
++| Item | Owner | Done? |
++| --- | --- | --- |
++| TODO | TODO | TODO |
++
++## Done
++
++TODO
++
++## Not done (and why)
++
++TODO
++
++## Review: feedback received
++
++TODO
++
++## Retrospective agreements
++
++TODO
+diff -ruN 08-smoke-blue-green/docs/scrum/sprint-2.md 09-docs/docs/scrum/sprint-2.md
+--- 08-smoke-blue-green/docs/scrum/sprint-2.md	1970-01-01 01:00:00
++++ 09-docs/docs/scrum/sprint-2.md	2026-11-22 20:34:04
+@@ -0,0 +1,41 @@
++# Sprint 2 (19–24 Nov)
++
++<!-- TODO(team): fill in from the real Planning, Review and Retrospective. Do not invent anything. -->
++
++Brief's goal for this sprint: MVP complete, monitoring, documentation.
++
++## Roles
++
++| Role | Member |
++| --- | --- |
++| Product Owner | TODO |
++| Scrum Master | TODO |
++| Developers | everyone |
++
++## Sprint Goal
++
++TODO
++
++## Items selected at Planning
++
++Link the GitHub Project items.
++
++| Item | Owner | Done? |
++| --- | --- | --- |
++| TODO | TODO | TODO |
++
++## Done
++
++TODO
++
++## Not done (and why)
++
++TODO
++
++## Review: feedback received
++
++TODO
++
++## Retrospective agreements
++
++TODO

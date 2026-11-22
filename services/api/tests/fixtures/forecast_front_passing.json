@@ -1,0 +1,227 @@
+{
+ "_comment": "Synthetic 24h forecast for one point: a front peaks at 11:00-12:00Z (30 kn, 3.1 m). Shape matches GET /forecast of the forecast service.",
+ "latitude": 41.38,
+ "longitude": 2.18,
+ "source": "open-meteo",
+ "cache": "hit",
+ "age_s": 0,
+ "stale": false,
+ "hours": [
+  {
+   "time": "2026-11-23T00:00Z",
+   "wind_kn": 8.0,
+   "gust_kn": 11.2,
+   "wind_dir_deg": 270,
+   "wave_m": 0.6,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T01:00Z",
+   "wind_kn": 9.0,
+   "gust_kn": 12.6,
+   "wind_dir_deg": 270,
+   "wave_m": 0.6,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T02:00Z",
+   "wind_kn": 10.0,
+   "gust_kn": 14.0,
+   "wind_dir_deg": 270,
+   "wave_m": 0.7,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T03:00Z",
+   "wind_kn": 11.0,
+   "gust_kn": 15.4,
+   "wind_dir_deg": 270,
+   "wave_m": 0.8,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T04:00Z",
+   "wind_kn": 12.0,
+   "gust_kn": 16.8,
+   "wind_dir_deg": 270,
+   "wave_m": 0.9,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T05:00Z",
+   "wind_kn": 14.0,
+   "gust_kn": 19.6,
+   "wind_dir_deg": 270,
+   "wave_m": 1.0,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T06:00Z",
+   "wind_kn": 16.0,
+   "gust_kn": 22.4,
+   "wind_dir_deg": 270,
+   "wave_m": 1.2,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T07:00Z",
+   "wind_kn": 18.0,
+   "gust_kn": 25.2,
+   "wind_dir_deg": 270,
+   "wave_m": 1.4,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T08:00Z",
+   "wind_kn": 20.0,
+   "gust_kn": 28.0,
+   "wind_dir_deg": 270,
+   "wave_m": 1.7,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T09:00Z",
+   "wind_kn": 22.0,
+   "gust_kn": 30.8,
+   "wind_dir_deg": 270,
+   "wave_m": 2.0,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T10:00Z",
+   "wind_kn": 26.0,
+   "gust_kn": 36.4,
+   "wind_dir_deg": 270,
+   "wave_m": 2.4,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T11:00Z",
+   "wind_kn": 30.0,
+   "gust_kn": 42.0,
+   "wind_dir_deg": 270,
+   "wave_m": 2.9,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T12:00Z",
+   "wind_kn": 28.0,
+   "gust_kn": 39.2,
+   "wind_dir_deg": 270,
+   "wave_m": 3.1,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T13:00Z",
+   "wind_kn": 24.0,
+   "gust_kn": 33.6,
+   "wind_dir_deg": 270,
+   "wave_m": 2.8,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T14:00Z",
+   "wind_kn": 19.0,
+   "gust_kn": 26.6,
+   "wind_dir_deg": 270,
+   "wave_m": 2.4,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T15:00Z",
+   "wind_kn": 16.0,
+   "gust_kn": 22.4,
+   "wind_dir_deg": 270,
+   "wave_m": 2.0,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T16:00Z",
+   "wind_kn": 14.0,
+   "gust_kn": 19.6,
+   "wind_dir_deg": 270,
+   "wave_m": 1.7,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T17:00Z",
+   "wind_kn": 12.0,
+   "gust_kn": 16.8,
+   "wind_dir_deg": 270,
+   "wave_m": 1.4,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T18:00Z",
+   "wind_kn": 11.0,
+   "gust_kn": 15.4,
+   "wind_dir_deg": 270,
+   "wave_m": 1.2,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T19:00Z",
+   "wind_kn": 10.0,
+   "gust_kn": 14.0,
+   "wind_dir_deg": 270,
+   "wave_m": 1.0,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T20:00Z",
+   "wind_kn": 9.0,
+   "gust_kn": 12.6,
+   "wind_dir_deg": 270,
+   "wave_m": 0.9,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T21:00Z",
+   "wind_kn": 9.0,
+   "gust_kn": 12.6,
+   "wind_dir_deg": 270,
+   "wave_m": 0.8,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T22:00Z",
+   "wind_kn": 8.0,
+   "gust_kn": 11.2,
+   "wind_dir_deg": 270,
+   "wave_m": 0.8,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  },
+  {
+   "time": "2026-11-23T23:00Z",
+   "wind_kn": 8.0,
+   "gust_kn": 11.2,
+   "wind_dir_deg": 270,
+   "wave_m": 0.7,
+   "wave_dir_deg": 260,
+   "wave_period_s": 6.0
+  }
+ ]
+}

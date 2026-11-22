@@ -1,0 +1,204 @@
+# CD (brief §5): on merge to main, run CI, push SHA-tagged images to GHCR, apply the
+# infrastructure (Bicep) with the new images, deploy the UI to Static Web Apps, and fail the
+# run if /health does not return 200 in time. Migrations run on service startup.
+#
+# Azure login is OpenID Connect: no client secret or credentials JSON is stored anywhere.
+# Setup (one time): docs/azure-setup.md.
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cd-production
+  cancel-in-progress: false
+
+env:
+  PREFIX: ${{ vars.GROUP_PREFIX }}                 # e.g. sdd-3a-g3
+  RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }} # e.g. rg-sdd-3a-g3
+  # "bluegreen" = new revisions are smoke-tested at 0% traffic before the switch (scripts/bluegreen.sh).
+  # Anything else = Bicep replaces the revision in place. Turn blue-green on only once plain deploys are green.
+  STRATEGY: ${{ vars.DEPLOY_STRATEGY }}
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  images:
+    name: Push ${{ matrix.service }} image
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        service: [api, forecast]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image name (GHCR needs lowercase)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/${{ matrix.service }}" >> "$GITHUB_ENV"
+      - name: Build and push ${{ github.sha }}
+        uses: docker/build-push-action@v6
+        with:
+          context: services/${{ matrix.service }}
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  deploy:
+    name: Deploy to Azure
+    needs: images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC token for azure/login
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check configuration
+        run: |
+          for v in GROUP_PREFIX AZURE_RESOURCE_GROUP AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID; do
+            [ -n "${!v}" ] || { echo "::error::GitHub variable $v is not set (see docs/azure-setup.md)"; exit 1; }
+          done
+          [ -n "$SQL_ADMIN_PASSWORD" ] || { echo "::error::GitHub secret SQL_ADMIN_PASSWORD is not set"; exit 1; }
+        env:
+          GROUP_PREFIX: ${{ vars.GROUP_PREFIX }}
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Decide deploy strategy
+        id: plan
+        run: |
+          IMAGE_BASE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "IMAGE_BASE=$IMAGE_BASE" >> "$GITHUB_ENV"
+          show() { az containerapp show -n "$PREFIX-$1" -g "$RESOURCE_GROUP" --query "$2" -o tsv; }
+          if [ "$STRATEGY" = "bluegreen" ] && az containerapp show -n "$PREFIX-api" -g "$RESOURCE_GROUP" -o none 2>/dev/null; then
+            # Bicep keeps today's images and pins traffic to today's revisions; bluegreen.sh adds the new ones.
+            {
+              echo "bluegreen=true"
+              echo "mode=Multiple"
+              echo "apiImage=$(show api 'properties.template.containers[0].image')"
+              echo "forecastImage=$(show forecast 'properties.template.containers[0].image')"
+              echo "version=$(show api "properties.template.containers[0].env[?name=='APP_VERSION'].value | [0]")"
+              echo "apiStable=$(show api 'properties.latestReadyRevisionName')"
+              echo "forecastStable=$(show forecast 'properties.latestReadyRevisionName')"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "bluegreen=false"
+              echo "mode=Single"
+              echo "apiImage=$IMAGE_BASE/api:$GITHUB_SHA"
+              echo "forecastImage=$IMAGE_BASE/forecast:$GITHUB_SHA"
+              echo "version=$GITHUB_SHA"
+            } >> "$GITHUB_OUTPUT"
+          fi
+          cat "$GITHUB_OUTPUT"
+
+      - name: Apply infrastructure (Bicep)
+        id: infra
+        env:
+          SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+        run: |
+          az deployment group create \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "cd-${GITHUB_RUN_NUMBER}" \
+            --template-file infra/main.bicep \
+            --parameters prefix="$PREFIX" \
+                         apiImage="${{ steps.plan.outputs.apiImage }}" \
+                         forecastImage="${{ steps.plan.outputs.forecastImage }}" \
+                         appVersion="${{ steps.plan.outputs.version }}" \
+                         revisionsMode="${{ steps.plan.outputs.mode }}" \
+                         apiStableRevision="${{ steps.plan.outputs.apiStable }}" \
+                         forecastStableRevision="${{ steps.plan.outputs.forecastStable }}" \
+                         sqlAdminPassword="$SQL_ADMIN_PASSWORD" \
+                         ghcrUsername="${{ github.repository_owner }}" \
+                         ghcrToken="$GHCR_PULL_TOKEN" \
+            --query properties.outputs -o json > outputs.json
+          for key in apiUrl forecastUrl uiUrl; do
+            echo "$key=$(jq -r ".$key.value" outputs.json)" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Blue-green switch (only when DEPLOY_STRATEGY=bluegreen)
+        if: steps.plan.outputs.bluegreen == 'true'
+        env:
+          VERSION: ${{ github.sha }}
+        run: scripts/bluegreen.sh
+
+      - name: Point the UI at the deployed services
+        run: |
+          cat > ui/config.js <<EOF
+          // Written by the CD pipeline (run ${GITHUB_RUN_NUMBER}, commit ${GITHUB_SHA}).
+          window.APP_CONFIG = {
+            apiUrl: "${{ steps.infra.outputs.apiUrl }}",
+            forecastUrl: "${{ steps.infra.outputs.forecastUrl }}",
+          };
+          EOF
+          cat ui/config.js
+
+      - name: Get the Static Web App deploy token
+        id: swa
+        run: |
+          token=$(az staticwebapp secrets list --name "$PREFIX-ui" --resource-group "$RESOURCE_GROUP" \
+                  --query properties.apiKey -o tsv)
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy UI to Static Web Apps
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ steps.swa.outputs.token }}
+          action: upload
+          app_location: ui
+          skip_app_build: true
+          skip_api_build: true
+
+      - name: Smoke test /health on every component
+        env:
+          API_URL: ${{ steps.infra.outputs.apiUrl }}
+          FORECAST_URL: ${{ steps.infra.outputs.forecastUrl }}
+          UI_URL: ${{ steps.infra.outputs.uiUrl }}
+          EXPECTED_VERSION: ${{ github.sha }}
+        run: scripts/smoke-health.sh
+
+      - name: End-to-end smoke test against the deployed URL
+        env:
+          API_URL: ${{ steps.infra.outputs.apiUrl }}
+          UI_URL: ${{ steps.infra.outputs.uiUrl }}
+        run: scripts/smoke-e2e.sh
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Deployed ${GITHUB_SHA::7}"
+            echo "- UI: ${{ steps.infra.outputs.uiUrl }}"
+            echo "- API: ${{ steps.infra.outputs.apiUrl }}/docs"
+            echo "- Forecast: ${{ steps.infra.outputs.forecastUrl }}/docs"
+          } >> "$GITHUB_STEP_SUMMARY"

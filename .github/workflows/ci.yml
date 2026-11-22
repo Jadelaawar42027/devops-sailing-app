@@ -1,0 +1,95 @@
+# CI (brief §5): lint, format check, tests with coverage (fail below 70%), image build.
+# Runs on every PR and every push. On main it runs as the first stage of cd.yml.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: ${{ matrix.service }} - lint, format, tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [api, forecast]
+    defaults:
+      run:
+        working-directory: services/${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: services/${{ matrix.service }}/requirements*.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Format check (ruff format)
+        run: ruff format --check .
+
+      - name: Tests with coverage (fail below 70%)
+        run: pytest --cov=app --cov-report=term-missing --cov-report=xml --cov-fail-under=70
+
+      - name: Dependency audit (pip-audit)
+        # Recommended by the brief, not required: report but do not block a release on a new CVE.
+        continue-on-error: true
+        run: |
+          pip install pip-audit==2.10.1
+          pip-audit -r requirements.txt
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.service }}
+          path: services/${{ matrix.service }}/coverage.xml
+          if-no-files-found: ignore
+
+  ui:
+    name: ui - format check and syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Format check (prettier)
+        run: npx --yes prettier@3.3.3 --check ui
+      - name: JavaScript syntax check
+        run: for f in ui/*.js; do node --check "$f"; done
+
+  images:
+    name: ${{ matrix.service }} - image build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [api, forecast]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: services/${{ matrix.service }}
+          push: false
+          tags: ${{ matrix.service }}:ci
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}

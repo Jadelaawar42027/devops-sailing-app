@@ -1,0 +1,216 @@
+diff -ruN 07-infra-cd/.github/workflows/cd.yml 08-smoke-blue-green/.github/workflows/cd.yml
+--- 07-infra-cd/.github/workflows/cd.yml	2026-11-22 20:30:40
++++ 08-smoke-blue-green/.github/workflows/cd.yml	2026-11-22 20:32:31
+@@ -21,6 +21,9 @@
+ env:
+   PREFIX: ${{ vars.GROUP_PREFIX }}                 # e.g. sdd-3a-g3
+   RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }} # e.g. rg-sdd-3a-g3
++  # "bluegreen" = new revisions are smoke-tested at 0% traffic before the switch (scripts/bluegreen.sh).
++  # Anything else = Bicep replaces the revision in place. Turn blue-green on only once plain deploys are green.
++  STRATEGY: ${{ vars.DEPLOY_STRATEGY }}
+ 
+ jobs:
+   ci:
+@@ -89,21 +92,51 @@
+           tenant-id: ${{ vars.AZURE_TENANT_ID }}
+           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+ 
+-      - name: Apply infrastructure and deploy both services (Bicep)
++      - name: Decide deploy strategy
++        id: plan
++        run: |
++          IMAGE_BASE="ghcr.io/${GITHUB_REPOSITORY,,}"
++          echo "IMAGE_BASE=$IMAGE_BASE" >> "$GITHUB_ENV"
++          show() { az containerapp show -n "$PREFIX-$1" -g "$RESOURCE_GROUP" --query "$2" -o tsv; }
++          if [ "$STRATEGY" = "bluegreen" ] && az containerapp show -n "$PREFIX-api" -g "$RESOURCE_GROUP" -o none 2>/dev/null; then
++            # Bicep keeps today's images and pins traffic to today's revisions; bluegreen.sh adds the new ones.
++            {
++              echo "bluegreen=true"
++              echo "mode=Multiple"
++              echo "apiImage=$(show api 'properties.template.containers[0].image')"
++              echo "forecastImage=$(show forecast 'properties.template.containers[0].image')"
++              echo "version=$(show api "properties.template.containers[0].env[?name=='APP_VERSION'].value | [0]")"
++              echo "apiStable=$(show api 'properties.latestReadyRevisionName')"
++              echo "forecastStable=$(show forecast 'properties.latestReadyRevisionName')"
++            } >> "$GITHUB_OUTPUT"
++          else
++            {
++              echo "bluegreen=false"
++              echo "mode=Single"
++              echo "apiImage=$IMAGE_BASE/api:$GITHUB_SHA"
++              echo "forecastImage=$IMAGE_BASE/forecast:$GITHUB_SHA"
++              echo "version=$GITHUB_SHA"
++            } >> "$GITHUB_OUTPUT"
++          fi
++          cat "$GITHUB_OUTPUT"
++
++      - name: Apply infrastructure (Bicep)
+         id: infra
+         env:
+           SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
+           GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+         run: |
+-          IMAGE_BASE="ghcr.io/${GITHUB_REPOSITORY,,}"
+           az deployment group create \
+             --resource-group "$RESOURCE_GROUP" \
+             --name "cd-${GITHUB_RUN_NUMBER}" \
+             --template-file infra/main.bicep \
+             --parameters prefix="$PREFIX" \
+-                         apiImage="$IMAGE_BASE/api:$GITHUB_SHA" \
+-                         forecastImage="$IMAGE_BASE/forecast:$GITHUB_SHA" \
+-                         appVersion="$GITHUB_SHA" \
++                         apiImage="${{ steps.plan.outputs.apiImage }}" \
++                         forecastImage="${{ steps.plan.outputs.forecastImage }}" \
++                         appVersion="${{ steps.plan.outputs.version }}" \
++                         revisionsMode="${{ steps.plan.outputs.mode }}" \
++                         apiStableRevision="${{ steps.plan.outputs.apiStable }}" \
++                         forecastStableRevision="${{ steps.plan.outputs.forecastStable }}" \
+                          sqlAdminPassword="$SQL_ADMIN_PASSWORD" \
+                          ghcrUsername="${{ github.repository_owner }}" \
+                          ghcrToken="$GHCR_PULL_TOKEN" \
+@@ -112,6 +145,12 @@
+             echo "$key=$(jq -r ".$key.value" outputs.json)" >> "$GITHUB_OUTPUT"
+           done
+ 
++      - name: Blue-green switch (only when DEPLOY_STRATEGY=bluegreen)
++        if: steps.plan.outputs.bluegreen == 'true'
++        env:
++          VERSION: ${{ github.sha }}
++        run: scripts/bluegreen.sh
++
+       - name: Point the UI at the deployed services
+         run: |
+           cat > ui/config.js <<EOF
+@@ -147,6 +186,12 @@
+           UI_URL: ${{ steps.infra.outputs.uiUrl }}
+           EXPECTED_VERSION: ${{ github.sha }}
+         run: scripts/smoke-health.sh
++
++      - name: End-to-end smoke test against the deployed URL
++        env:
++          API_URL: ${{ steps.infra.outputs.apiUrl }}
++          UI_URL: ${{ steps.infra.outputs.uiUrl }}
++        run: scripts/smoke-e2e.sh
+ 
+       - name: Summary
+         if: always()
+diff -ruN 07-infra-cd/scripts/bluegreen.sh 08-smoke-blue-green/scripts/bluegreen.sh
+--- 07-infra-cd/scripts/bluegreen.sh	1970-01-01 01:00:00
++++ 08-smoke-blue-green/scripts/bluegreen.sh	2026-11-22 20:32:10
+@@ -0,0 +1,57 @@
++#!/usr/bin/env bash
++# Blue-green deploy with Container Apps revisions (credited extra, brief §5). Used by cd.yml
++# only when the GitHub variable DEPLOY_STRATEGY is "bluegreen".
++#
++# For each service (forecast first, then api):
++#   1. create a new revision "v<sha7>" with the new image; it gets 0% traffic (label "green")
++#   2. smoke-test it on its own label URL: https://<app>---green.<environment domain>/health
++#   3. if healthy: move 100% of traffic to it and make it "blue"; keep the old one at 0% for rollback
++#      if not: deactivate it; the old revision never stopped serving
++#
++# Requires: az login, and the apps in Multiple revision mode (main.bicep revisionsMode=Multiple).
++# Migrations must stay backwards compatible (additive), because the new revision migrates the
++# database while the old one still serves traffic.
++set -euo pipefail
++
++: "${PREFIX:?}" "${RESOURCE_GROUP:?}" "${IMAGE_BASE:?}" "${VERSION:?}"
++SUFFIX="v${VERSION:0:7}"
++DOMAIN=$(az containerapp env show -n "$PREFIX-env" -g "$RESOURCE_GROUP" --query properties.defaultDomain -o tsv)
++
++wait_healthy() { # url
++  for _ in $(seq 1 30); do
++    if curl -sf -m 30 "$1/health" | grep -q "\"version\":\"$VERSION\""; then return 0; fi
++    sleep 10
++  done
++  return 1
++}
++
++deploy() { # service
++  local app="$PREFIX-$1" new="$PREFIX-$1--$SUFFIX" old
++  old=$(az containerapp ingress traffic show -n "$app" -g "$RESOURCE_GROUP" \
++        --query "[?weight==\`100\`].revisionName | [0]" -o tsv)
++  echo "== $app: blue=$old, green=$new"
++
++  az containerapp update -n "$app" -g "$RESOURCE_GROUP" --image "$IMAGE_BASE/$1:$VERSION" \
++    --revision-suffix "$SUFFIX" --set-env-vars "APP_VERSION=$VERSION" -o none
++  az containerapp revision label add -n "$app" -g "$RESOURCE_GROUP" --label green \
++    --revision "$new" --no-prompt -o none
++
++  if wait_healthy "https://$app---green.$DOMAIN"; then
++    echo "green is healthy: switching traffic"
++    az containerapp ingress traffic set -n "$app" -g "$RESOURCE_GROUP" \
++      --revision-weight "$new=100" "$old=0" -o none
++    az containerapp revision label remove -n "$app" -g "$RESOURCE_GROUP" --label green -o none
++    az containerapp revision label remove -n "$app" -g "$RESOURCE_GROUP" --label blue -o none 2>/dev/null || true
++    az containerapp revision label add -n "$app" -g "$RESOURCE_GROUP" --label blue \
++      --revision "$new" --no-prompt -o none
++    echo "rollback if needed: az containerapp ingress traffic set -n $app -g $RESOURCE_GROUP --revision-weight $old=100 $new=0"
++  else
++    echo "::error::green revision $new failed its health check; blue ($old) keeps 100% of traffic"
++    az containerapp revision label remove -n "$app" -g "$RESOURCE_GROUP" --label green -o none || true
++    az containerapp revision deactivate -n "$app" -g "$RESOURCE_GROUP" --revision "$new" -o none || true
++    exit 1
++  fi
++}
++
++deploy forecast
++deploy api
+diff -ruN 07-infra-cd/scripts/smoke-e2e.sh 08-smoke-blue-green/scripts/smoke-e2e.sh
+--- 07-infra-cd/scripts/smoke-e2e.sh	1970-01-01 01:00:00
++++ 08-smoke-blue-green/scripts/smoke-e2e.sh	2026-11-22 20:32:10
+@@ -0,0 +1,55 @@
++#!/usr/bin/env bash
++# End-to-end smoke test against a deployed system (credited extra, brief §5).
++# Creates a boat and a passage, asks for its windows, checks CORS for the UI origin, then
++# deletes what it created. Fails (exit 1) on the first broken step.
++#
++#   API_URL=https://... UI_URL=https://... scripts/smoke-e2e.sh
++set -euo pipefail
++
++API_URL="${API_URL:?set API_URL}"
++UI_URL="${UI_URL:-}"
++TMP=$(mktemp -d)
++BOAT_ID=""
++PASSAGE_ID=""
++
++cleanup() {
++  [[ -n "$PASSAGE_ID" ]] && curl -s -o /dev/null -m 30 -X DELETE "$API_URL/passages/$PASSAGE_ID" || true
++  [[ -n "$BOAT_ID" ]] && curl -s -o /dev/null -m 30 -X DELETE "$API_URL/boats/$BOAT_ID" || true
++  rm -rf "$TMP"
++}
++trap cleanup EXIT
++
++step() { # name expected_code method path [json]
++  local name=$1 want=$2 method=$3 path=$4 code
++  if [[ $# -ge 5 ]]; then
++    code=$(curl -s -o "$TMP/body" -w '%{http_code}' -m 60 -X "$method" -H 'Content-Type: application/json' -d "$5" "$API_URL$path")
++  else
++    code=$(curl -s -o "$TMP/body" -w '%{http_code}' -m 60 -X "$method" "$API_URL$path")
++  fi
++  if [[ "$code" != "$want" ]]; then
++    echo "FAIL $name: $method $path -> $code (want $want): $(head -c 300 "$TMP/body")"
++    exit 1
++  fi
++  echo "OK   $name ($code)"
++}
++field() { python3 -c "import json,sys; print(json.load(open('$TMP/body'))$1)"; }
++
++step "create boat" 201 POST /boats '{"name":"Smoke test boat","max_wind_kn":20,"max_gust_kn":28,"max_wave_m":2}'
++BOAT_ID=$(field '["id"]')
++step "create passage" 201 POST /passages "{\"name\":\"Smoke test passage\",\"boat_id\":$BOAT_ID,\"start_lat\":41.37,\"start_lon\":2.19,\"end_lat\":41.23,\"end_lon\":1.81,\"speed_kn\":6}"
++PASSAGE_ID=$(field '["id"]')
++step "read passage" 200 GET "/passages/$PASSAGE_ID"
++step "departure windows" 200 GET "/passages/$PASSAGE_ID/windows"
++echo "     $(field '["summary"]["go"]') of $(field '["summary"]["windows"]') windows GO"
++step "validation rejects bad input" 422 POST /boats '{"name":"","max_wind_kn":-1,"max_wave_m":2}'
++
++if [[ -n "$UI_URL" ]]; then
++  allowed=$(curl -s -D - -o /dev/null -m 30 -X OPTIONS "$API_URL/boats" \
++    -H "Origin: $UI_URL" -H "Access-Control-Request-Method: GET" | tr -d '\r' \
++    | awk -F': ' 'tolower($1)=="access-control-allow-origin"{print $2}')
++  if [[ "$allowed" == "$UI_URL" ]]; then echo "OK   CORS allows $UI_URL"; else echo "FAIL CORS: got '$allowed'"; exit 1; fi
++fi
++
++step "delete passage" 204 DELETE "/passages/$PASSAGE_ID"; PASSAGE_ID=""
++step "delete boat" 204 DELETE "/boats/$BOAT_ID"; BOAT_ID=""
++echo "End-to-end smoke test passed."

@@ -1,0 +1,19 @@
+// Dashboard tile 2: error rate (% of requests answered 5xx) per service, 5-minute bins.
+// 503 "degraded" answers count as errors on purpose: the user did not get their windows.
+// Request log lines written by both services (app/logging_setup.py), one JSON object per line.
+// Works with both table names Container Apps uses (classic *_CL and the newer one).
+let Requests = union isfuzzy=true
+    (ContainerAppConsoleLogs_CL | project TimeGenerated, App = ContainerAppName_s, Line = Log_s),
+    (ContainerAppConsoleLogs | project TimeGenerated, App = ContainerAppName, Line = Log)
+| where Line startswith "{"
+| extend j = parse_json(Line)
+| where tostring(j.msg) == "request"
+| extend service = tostring(j.service), method = tostring(j.method), route = tostring(j.route),
+         status = toint(j.status), duration_ms = todouble(j.duration_ms);
+Requests
+| where TimeGenerated > ago(24h)
+| summarize total = count(), errors = countif(status >= 500), client_errors = countif(status between (400 .. 499))
+    by bin(TimeGenerated, 5m), service
+| extend error_rate_pct = round(100.0 * errors / total, 2)
+| project TimeGenerated, service, error_rate_pct, errors, client_errors, total
+| render timechart

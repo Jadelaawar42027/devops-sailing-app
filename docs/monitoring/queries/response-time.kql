@@ -1,0 +1,16 @@
+// Dashboard tile 3: response time percentiles (ms) per service, 5-minute bins.
+// Request log lines written by both services (app/logging_setup.py), one JSON object per line.
+// Works with both table names Container Apps uses (classic *_CL and the newer one).
+let Requests = union isfuzzy=true
+    (ContainerAppConsoleLogs_CL | project TimeGenerated, App = ContainerAppName_s, Line = Log_s),
+    (ContainerAppConsoleLogs | project TimeGenerated, App = ContainerAppName, Line = Log)
+| where Line startswith "{"
+| extend j = parse_json(Line)
+| where tostring(j.msg) == "request"
+| extend service = tostring(j.service), method = tostring(j.method), route = tostring(j.route),
+         status = toint(j.status), duration_ms = todouble(j.duration_ms);
+Requests
+| where TimeGenerated > ago(24h)
+| summarize p50 = percentile(duration_ms, 50), p95 = percentile(duration_ms, 95),
+            p99 = percentile(duration_ms, 99) by bin(TimeGenerated, 5m), service
+| render timechart

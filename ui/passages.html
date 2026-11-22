@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0f1f29" />
+    <title>Passages · Passage planner</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="config.js"></script>
+    <script type="module" src="passages.js"></script>
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <header class="site-header">
+      <a class="wordmark" href="index.html" translate="no">Passage planner</a>
+      <nav aria-label="Main">
+        <a href="index.html">Plan</a>
+        <a href="passages.html" aria-current="page">Passages</a>
+        <a href="boats.html">Boats</a>
+      </nav>
+    </header>
+    <main id="main">
+      <h1>Passages</h1>
+      <p class="lead">A passage is a start, an end and the speed you expect to average.</p>
+      <p class="message" id="message" role="status" aria-live="polite" hidden></p>
+      <div class="split">
+        <section aria-labelledby="list-title">
+          <h2 id="list-title">Your passages</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">Name</th>
+                  <th scope="col">Boat</th>
+                  <th scope="col">From → to</th>
+                  <th scope="col" class="num">Speed</th>
+                  <th scope="col"><span class="sr-only">Actions</span></th>
+                </tr>
+              </thead>
+              <tbody id="rows"></tbody>
+            </table>
+          </div>
+        </section>
+        <section class="panel" aria-labelledby="form-title">
+          <h2 id="form-title">Add a passage</h2>
+          <form id="form" novalidate>
+            <input type="hidden" name="id" />
+            <div class="field">
+              <label for="name">Name</label>
+              <input
+                id="name"
+                name="name"
+                required
+                maxlength="100"
+                autocomplete="off"
+                placeholder="Barcelona to Sitges…"
+              />
+            </div>
+            <div class="field">
+              <label for="boat_id">Boat</label>
+              <select
+                id="boat_id"
+                name="boat_id"
+                data-type="number"
+                autocomplete="off"
+                required
+              ></select>
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label for="start_lat">Start latitude</label>
+                <input
+                  id="start_lat"
+                  name="start_lat"
+                  type="number"
+                  autocomplete="off"
+                  inputmode="decimal"
+                  min="-90"
+                  max="90"
+                  step="any"
+                  required
+                  placeholder="41.37…"
+                />
+              </div>
+              <div class="field">
+                <label for="start_lon">Start longitude</label>
+                <input
+                  id="start_lon"
+                  name="start_lon"
+                  type="number"
+                  autocomplete="off"
+                  inputmode="decimal"
+                  min="-180"
+                  max="180"
+                  step="any"
+                  required
+                  placeholder="2.19…"
+                />
+              </div>
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label for="end_lat">End latitude</label>
+                <input
+                  id="end_lat"
+                  name="end_lat"
+                  type="number"
+                  autocomplete="off"
+                  inputmode="decimal"
+                  min="-90"
+                  max="90"
+                  step="any"
+                  required
+                  placeholder="41.23…"
+                />
+              </div>
+              <div class="field">
+                <label for="end_lon">End longitude</label>
+                <input
+                  id="end_lon"
+                  name="end_lon"
+                  type="number"
+                  autocomplete="off"
+                  inputmode="decimal"
+                  min="-180"
+                  max="180"
+                  step="any"
+                  required
+                  placeholder="1.81…"
+                />
+              </div>
+            </div>
+            <span class="hint">Decimal degrees. North and east are positive.</span>
+            <div class="field">
+              <label for="speed_kn">Planned average speed (kn)</label>
+              <input
+                id="speed_kn"
+                name="speed_kn"
+                type="number"
+                autocomplete="off"
+                inputmode="decimal"
+                min="0.5"
+                max="40"
+                step="0.1"
+                value="6"
+                required
+              />
+            </div>
+            <p class="message" id="form-message" role="alert" hidden></p>
+            <div class="actions">
+              <button type="submit" id="submit">Save passage</button>
+              <button type="button" class="secondary" id="cancel" hidden>Cancel edit</button>
+            </div>
+          </form>
+        </section>
+      </div>
+    </main>
+  </body>
+</html>

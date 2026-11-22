@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0f1f29" />
+    <title>Boats · Passage planner</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="config.js"></script>
+    <script type="module" src="boats.js"></script>
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <header class="site-header">
+      <a class="wordmark" href="index.html" translate="no">Passage planner</a>
+      <nav aria-label="Main">
+        <a href="index.html">Plan</a>
+        <a href="passages.html">Passages</a>
+        <a href="boats.html" aria-current="page">Boats</a>
+      </nav>
+    </header>
+    <main id="main">
+      <h1>Boats</h1>
+      <p class="lead">Each boat carries the limits it can sail in safely.</p>
+      <p class="message" id="message" role="status" aria-live="polite" hidden></p>
+      <div class="split">
+        <section aria-labelledby="list-title">
+          <h2 id="list-title">Your boats</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">Name</th>
+                  <th scope="col" class="num">Max wind</th>
+                  <th scope="col" class="num">Max gust</th>
+                  <th scope="col" class="num">Max waves</th>
+                  <th scope="col"><span class="sr-only">Actions</span></th>
+                </tr>
+              </thead>
+              <tbody id="rows"></tbody>
+            </table>
+          </div>
+        </section>
+        <section class="panel" aria-labelledby="form-title">
+          <h2 id="form-title">Add a boat</h2>
+          <form id="form" novalidate>
+            <input type="hidden" name="id" />
+            <div class="field">
+              <label for="name">Name</label>
+              <input id="name" name="name" required maxlength="100" autocomplete="off" />
+            </div>
+            <!-- TODO(team): default limits below are placeholders for a ~10 m cruising yacht. -->
+            <div class="field-row">
+              <div class="field">
+                <label for="max_wind_kn">Max wind (kn)</label>
+                <input
+                  id="max_wind_kn"
+                  name="max_wind_kn"
+                  type="number"
+                  autocomplete="off"
+                  inputmode="decimal"
+                  min="1"
+                  max="80"
+                  step="0.1"
+                  value="20"
+                  required
+                />
+              </div>
+              <div class="field">
+                <label for="max_gust_kn">Max gust (kn)</label>
+                <input
+                  id="max_gust_kn"
+                  name="max_gust_kn"
+                  type="number"
+                  autocomplete="off"
+                  inputmode="decimal"
+                  min="1"
+                  max="100"
+                  step="0.1"
+                  value="28"
+                />
+                <span class="hint">Leave empty to ignore gusts.</span>
+              </div>
+            </div>
+            <div class="field">
+              <label for="max_wave_m">Max significant wave height (m)</label>
+              <input
+                id="max_wave_m"
+                name="max_wave_m"
+                type="number"
+                autocomplete="off"
+                inputmode="decimal"
+                min="0.1"
+                max="15"
+                step="0.1"
+                value="2"
+                required
+              />
+            </div>
+            <p class="message" id="form-message" role="alert" hidden></p>
+            <div class="actions">
+              <button type="submit" id="submit">Save boat</button>
+              <button type="button" class="secondary" id="cancel" hidden>Cancel edit</button>
+            </div>
+          </form>
+        </section>
+      </div>
+    </main>
+  </body>
+</html>

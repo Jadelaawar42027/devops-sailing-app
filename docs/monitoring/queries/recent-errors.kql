@@ -1,0 +1,12 @@
+// Troubleshooting: the latest warnings and errors from both services (no request bodies are logged).
+union isfuzzy=true
+    (ContainerAppConsoleLogs_CL | project TimeGenerated, App = ContainerAppName_s, Line = Log_s),
+    (ContainerAppConsoleLogs | project TimeGenerated, App = ContainerAppName, Line = Log)
+| where Line startswith "{"
+| extend j = parse_json(Line)
+| extend level = tostring(j.level), status = toint(j.status)
+| where level in ("WARNING", "ERROR") or status >= 500
+| project TimeGenerated, App, level, msg = tostring(j.msg), route = tostring(j.route), status,
+          error = tostring(j.error), reason = tostring(j.reason)
+| order by TimeGenerated desc
+| take 100

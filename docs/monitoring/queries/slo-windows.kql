@@ -1,0 +1,24 @@
+// SLO: 99% of GET /passages/{id}/windows requests answer successfully in under 1 s, over 1 h.
+// "Good" = status below 500 AND duration under the target. A 503 "degraded" answer is bad.
+// TODO(team): agree the SLO target numbers (objective and latency) and keep docs/monitoring/slo.md in sync.
+let objective_pct = 99.0;
+let target_ms = 1000.0;
+let slo_window = 1h;
+// Request log lines written by both services (app/logging_setup.py), one JSON object per line.
+// Works with both table names Container Apps uses (classic *_CL and the newer one).
+let Requests = union isfuzzy=true
+    (ContainerAppConsoleLogs_CL | project TimeGenerated, App = ContainerAppName_s, Line = Log_s),
+    (ContainerAppConsoleLogs | project TimeGenerated, App = ContainerAppName, Line = Log)
+| where Line startswith "{"
+| extend j = parse_json(Line)
+| where tostring(j.msg) == "request"
+| extend service = tostring(j.service), method = tostring(j.method), route = tostring(j.route),
+         status = toint(j.status), duration_ms = todouble(j.duration_ms);
+Requests
+| where TimeGenerated > ago(slo_window)
+| where service == "api" and method == "GET" and route == "/passages/{passage_id}/windows"
+| summarize total = count(), good = countif(status < 500 and duration_ms < target_ms)
+| extend sli_pct = iff(total == 0, real(null), round(100.0 * good / total, 2))
+| extend objective_pct = objective_pct, slo_met = sli_pct >= objective_pct,
+         error_budget_left_pct = iff(total == 0, real(null),
+             round(100.0 * (1 - (total - good) / ((1 - objective_pct / 100) * total)), 1))

@@ -1,0 +1,15 @@
+// Dashboard tile 1: request count per service, 5-minute bins, last 24 h.
+// Request log lines written by both services (app/logging_setup.py), one JSON object per line.
+// Works with both table names Container Apps uses (classic *_CL and the newer one).
+let Requests = union isfuzzy=true
+    (ContainerAppConsoleLogs_CL | project TimeGenerated, App = ContainerAppName_s, Line = Log_s),
+    (ContainerAppConsoleLogs | project TimeGenerated, App = ContainerAppName, Line = Log)
+| where Line startswith "{"
+| extend j = parse_json(Line)
+| where tostring(j.msg) == "request"
+| extend service = tostring(j.service), method = tostring(j.method), route = tostring(j.route),
+         status = toint(j.status), duration_ms = todouble(j.duration_ms);
+Requests
+| where TimeGenerated > ago(24h)
+| summarize requests = count() by bin(TimeGenerated, 5m), service
+| render timechart

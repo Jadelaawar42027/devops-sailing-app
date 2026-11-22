@@ -1,0 +1,6 @@
+# Prettier only checks the static UI (Python is formatted by ruff).
+services/
+docs/
+infra/
+*.md
+*.yml

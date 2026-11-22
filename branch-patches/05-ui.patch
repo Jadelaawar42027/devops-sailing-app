@@ -1,0 +1,1468 @@
+diff -ruN 04-scoring/.github/workflows/ci.yml 05-ui/.github/workflows/ci.yml
+--- 04-scoring/.github/workflows/ci.yml	2026-11-22 20:09:13
++++ 05-ui/.github/workflows/ci.yml	2026-11-22 20:25:16
+@@ -62,6 +62,19 @@
+           path: services/${{ matrix.service }}/coverage.xml
+           if-no-files-found: ignore
+ 
++  ui:
++    name: ui - format check and syntax
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-node@v4
++        with:
++          node-version: "22"
++      - name: Format check (prettier)
++        run: npx --yes prettier@3.3.3 --check ui
++      - name: JavaScript syntax check
++        run: for f in ui/*.js; do node --check "$f"; done
++
+   images:
+     name: ${{ matrix.service }} - image build
+     runs-on: ubuntu-latest
+diff -ruN 04-scoring/.prettierignore 05-ui/.prettierignore
+--- 04-scoring/.prettierignore	1970-01-01 01:00:00
++++ 05-ui/.prettierignore	2026-11-22 20:21:58
+@@ -0,0 +1,6 @@
++# Prettier only checks the static UI (Python is formatted by ruff).
++services/
++docs/
++infra/
++*.md
++*.yml
+diff -ruN 04-scoring/.prettierrc.json 05-ui/.prettierrc.json
+--- 04-scoring/.prettierrc.json	1970-01-01 01:00:00
++++ 05-ui/.prettierrc.json	2026-11-22 20:21:58
+@@ -0,0 +1 @@
++{ "printWidth": 100 }
+diff -ruN 04-scoring/docker/ui-nginx.conf 05-ui/docker/ui-nginx.conf
+--- 04-scoring/docker/ui-nginx.conf	1970-01-01 01:00:00
++++ 05-ui/docker/ui-nginx.conf	2026-11-22 20:22:10
+@@ -0,0 +1,9 @@
++# Local stand-in for Azure Static Web Apps (compose only). Serves ui/ read-only.
++server {
++  listen 8080;
++  root /usr/share/nginx/html;
++  index index.html;
++  add_header X-Content-Type-Options nosniff always;
++  location = /health { default_type application/json; try_files /health.json =404; }
++  location / { try_files $uri $uri/ =404; }
++}
+diff -ruN 04-scoring/docker-compose.yml 05-ui/docker-compose.yml
+--- 04-scoring/docker-compose.yml	2026-11-22 20:18:37
++++ 05-ui/docker-compose.yml	2026-11-22 20:22:10
+@@ -1,4 +1,5 @@
+ # Local run from a clean clone: docker compose up --build
++#   UI        http://localhost:8090
+ #   API       http://localhost:8010   (Swagger at /docs)
+ #   Forecast  http://localhost:8011
+ #
+@@ -56,6 +57,18 @@
+     depends_on:
+       db:
+         condition: service_healthy
++
++  ui:
++    # Static files only, like Azure Static Web Apps. Stock unprivileged nginx, no custom image.
++    image: nginxinc/nginx-unprivileged:1.27.5-alpine
++    ports:
++      - "8090:8080"
++    volumes:
++      - ./ui:/usr/share/nginx/html:ro
++      - ./docker/ui-nginx.conf:/etc/nginx/conf.d/default.conf:ro
++    depends_on:
++      - api
++      - forecast
+ 
+ volumes:
+   dbdata:
+diff -ruN 04-scoring/services/api/app/schemas.py 05-ui/services/api/app/schemas.py
+--- 04-scoring/services/api/app/schemas.py	2026-11-22 20:11:17
++++ 05-ui/services/api/app/schemas.py	2026-11-22 20:24:54
+@@ -18,7 +18,7 @@
+     @model_validator(mode="after")
+     def gust_not_below_wind(self) -> "BoatIn":
+         if self.max_gust_kn is not None and self.max_gust_kn < self.max_wind_kn:
+-            raise ValueError("max_gust_kn must be greater than or equal to max_wind_kn")
++            raise ValueError("Max gust must be at least the max wind")
+         return self
+ 
+ 
+diff -ruN 04-scoring/ui/api.js 05-ui/ui/api.js
+--- 04-scoring/ui/api.js	1970-01-01 01:00:00
++++ 05-ui/ui/api.js	2026-11-22 20:23:48
+@@ -0,0 +1,113 @@
++// Small fetch wrapper shared by every page. Never builds HTML from server data (no innerHTML).
++const CONFIG = window.APP_CONFIG || {};
++const TIMEOUT_MS = 15000;
++
++export class ApiError extends Error {
++  constructor(message, status, body) {
++    super(message);
++    this.status = status;
++    this.body = body;
++  }
++}
++
++function messageFrom(body, status) {
++  const detail = body && body.detail;
++  if (typeof detail === "string") return detail;
++  if (Array.isArray(detail)) {
++    // FastAPI validation errors: [{loc: [..., "field"], msg: "..."}]
++    return detail
++      .map((d) => {
++        const field = d.loc[d.loc.length - 1];
++        const msg = d.msg.replace(/^Value error, /, "");
++        return field === "body" ? msg : `${field.replaceAll("_", " ")}: ${msg}`;
++      })
++      .join(". ");
++  }
++  return `The server answered with status ${status}.`;
++}
++
++async function request(base, path, options = {}) {
++  const controller = new AbortController();
++  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
++  try {
++    const response = await fetch(base + path, {
++      ...options,
++      headers: { "Content-Type": "application/json" },
++      signal: controller.signal,
++    });
++    const body = response.status === 204 ? null : await response.json().catch(() => null);
++    if (!response.ok) throw new ApiError(messageFrom(body, response.status), response.status, body);
++    return body;
++  } catch (error) {
++    if (error instanceof ApiError) throw error;
++    if (error.name === "AbortError") {
++      throw new ApiError("The server did not answer within 15 seconds. Try again.", 0);
++    }
++    throw new ApiError("Cannot reach the server. Check your connection and try again.", 0);
++  } finally {
++    clearTimeout(timer);
++  }
++}
++
++const json = (method, data) => ({ method, body: JSON.stringify(data) });
++const apiCall = (path, options) => request(CONFIG.apiUrl, path, options);
++
++export const api = {
++  listBoats: () => apiCall("/boats"),
++  createBoat: (data) => apiCall("/boats", json("POST", data)),
++  updateBoat: (id, data) => apiCall(`/boats/${id}`, json("PUT", data)),
++  deleteBoat: (id) => apiCall(`/boats/${id}`, { method: "DELETE" }),
++  listPassages: () => apiCall("/passages"),
++  getPassage: (id) => apiCall(`/passages/${id}`),
++  createPassage: (data) => apiCall("/passages", json("POST", data)),
++  updatePassage: (id, data) => apiCall(`/passages/${id}`, json("PUT", data)),
++  deletePassage: (id) => apiCall(`/passages/${id}`, { method: "DELETE" }),
++  windows: (id) => apiCall(`/passages/${id}/windows`),
++  current: (lat, lon) =>
++    request(
++      CONFIG.forecastUrl,
++      `/current?lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}`,
++    ),
++};
++
++// Create an element: el("td", { class: "num" }, "12.5")
++export function el(tag, attrs = {}, ...children) {
++  const node = document.createElement(tag);
++  for (const [key, value] of Object.entries(attrs)) {
++    if (value === undefined || value === null || value === false) continue;
++    if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
++    else node.setAttribute(key, value === true ? "" : value);
++  }
++  node.append(...children.flat().filter((c) => c !== null && c !== undefined));
++  return node;
++}
++
++// Show a message in a status box. kind: "info" | "error" | "ok"
++export function showMessage(box, text, kind = "info") {
++  box.textContent = text;
++  box.dataset.kind = kind;
++  box.hidden = !text;
++}
++
++// All times are shown in UTC, like the forecast. TODO(team): offer local time if users ask.
++const DATE_FMT = new Intl.DateTimeFormat("en-GB", {
++  weekday: "short",
++  day: "numeric",
++  month: "short",
++  hour: "2-digit",
++  minute: "2-digit",
++  timeZone: "UTC",
++});
++export const formatTime = (iso) => `${DATE_FMT.format(new Date(iso))} UTC`;
++
++export function formFields(form) {
++  const data = {};
++  for (const input of form.querySelectorAll("input[name], select[name]")) {
++    if (input.type === "number" || input.dataset.type === "number") {
++      data[input.name] = input.value === "" ? null : Number(input.value);
++    } else {
++      data[input.name] = input.value;
++    }
++  }
++  return data;
++}
+diff -ruN 04-scoring/ui/boats.html 05-ui/ui/boats.html
+--- 04-scoring/ui/boats.html	1970-01-01 01:00:00
++++ 05-ui/ui/boats.html	2026-11-22 20:24:25
+@@ -0,0 +1,111 @@
++<!doctype html>
++<html lang="en">
++  <head>
++    <meta charset="utf-8" />
++    <meta name="viewport" content="width=device-width, initial-scale=1" />
++    <meta name="theme-color" content="#0f1f29" />
++    <title>Boats · Passage planner</title>
++    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
++    <link rel="stylesheet" href="styles.css" />
++    <script src="config.js"></script>
++    <script type="module" src="boats.js"></script>
++  </head>
++  <body>
++    <a class="skip" href="#main">Skip to content</a>
++    <header class="site-header">
++      <a class="wordmark" href="index.html" translate="no">Passage planner</a>
++      <nav aria-label="Main">
++        <a href="index.html">Plan</a>
++        <a href="passages.html">Passages</a>
++        <a href="boats.html" aria-current="page">Boats</a>
++      </nav>
++    </header>
++    <main id="main">
++      <h1>Boats</h1>
++      <p class="lead">Each boat carries the limits it can sail in safely.</p>
++      <p class="message" id="message" role="status" aria-live="polite" hidden></p>
++      <div class="split">
++        <section aria-labelledby="list-title">
++          <h2 id="list-title">Your boats</h2>
++          <div class="table-wrap">
++            <table>
++              <thead>
++                <tr>
++                  <th scope="col">Name</th>
++                  <th scope="col" class="num">Max wind</th>
++                  <th scope="col" class="num">Max gust</th>
++                  <th scope="col" class="num">Max waves</th>
++                  <th scope="col"><span class="sr-only">Actions</span></th>
++                </tr>
++              </thead>
++              <tbody id="rows"></tbody>
++            </table>
++          </div>
++        </section>
++        <section class="panel" aria-labelledby="form-title">
++          <h2 id="form-title">Add a boat</h2>
++          <form id="form" novalidate>
++            <input type="hidden" name="id" />
++            <div class="field">
++              <label for="name">Name</label>
++              <input id="name" name="name" required maxlength="100" autocomplete="off" />
++            </div>
++            <!-- TODO(team): default limits below are placeholders for a ~10 m cruising yacht. -->
++            <div class="field-row">
++              <div class="field">
++                <label for="max_wind_kn">Max wind (kn)</label>
++                <input
++                  id="max_wind_kn"
++                  name="max_wind_kn"
++                  type="number"
++                  autocomplete="off"
++                  inputmode="decimal"
++                  min="1"
++                  max="80"
++                  step="0.1"
++                  value="20"
++                  required
++                />
++              </div>
++              <div class="field">
++                <label for="max_gust_kn">Max gust (kn)</label>
++                <input
++                  id="max_gust_kn"
++                  name="max_gust_kn"
++                  type="number"
++                  autocomplete="off"
++                  inputmode="decimal"
++                  min="1"
++                  max="100"
++                  step="0.1"
++                  value="28"
++                />
++                <span class="hint">Leave empty to ignore gusts.</span>
++              </div>
++            </div>
++            <div class="field">
++              <label for="max_wave_m">Max significant wave height (m)</label>
++              <input
++                id="max_wave_m"
++                name="max_wave_m"
++                type="number"
++                autocomplete="off"
++                inputmode="decimal"
++                min="0.1"
++                max="15"
++                step="0.1"
++                value="2"
++                required
++              />
++            </div>
++            <p class="message" id="form-message" role="alert" hidden></p>
++            <div class="actions">
++              <button type="submit" id="submit">Save boat</button>
++              <button type="button" class="secondary" id="cancel" hidden>Cancel edit</button>
++            </div>
++          </form>
++        </section>
++      </div>
++    </main>
++  </body>
++</html>
+diff -ruN 04-scoring/ui/boats.js 05-ui/ui/boats.js
+--- 04-scoring/ui/boats.js	1970-01-01 01:00:00
++++ 05-ui/ui/boats.js	2026-11-22 20:21:56
+@@ -0,0 +1,19 @@
++import { api, el } from "./api.js";
++import { setupCrud } from "./crud.js";
++
++const fmt = (value, unit) => (value === null || value === undefined ? "—" : `${value} ${unit}`);
++
++const page = setupCrud({
++  noun: "boat",
++  load: api.listBoats,
++  create: api.createBoat,
++  update: api.updateBoat,
++  remove: api.deleteBoat,
++  renderRow: (boat) => [
++    el("td", {}, boat.name),
++    el("td", { class: "num" }, fmt(boat.max_wind_kn, "kn")),
++    el("td", { class: "num" }, fmt(boat.max_gust_kn, "kn")),
++    el("td", { class: "num" }, fmt(boat.max_wave_m, "m")),
++  ],
++});
++page.refresh();
+diff -ruN 04-scoring/ui/config.js 05-ui/ui/config.js
+--- 04-scoring/ui/config.js	1970-01-01 01:00:00
++++ 05-ui/ui/config.js	2026-11-22 20:20:26
+@@ -0,0 +1,6 @@
++// Where the two services live. This file is overwritten by the CD pipeline with the
++// Azure Container Apps URLs (see .github/workflows/cd.yml). Local values match docker-compose.
++window.APP_CONFIG = {
++  apiUrl: "http://localhost:8010",
++  forecastUrl: "http://localhost:8011",
++};
+diff -ruN 04-scoring/ui/crud.js 05-ui/ui/crud.js
+--- 04-scoring/ui/crud.js	1970-01-01 01:00:00
++++ 05-ui/ui/crud.js	2026-11-22 20:24:55
+@@ -0,0 +1,117 @@
++// Shared list + form behaviour for the boats and passages pages.
++import { el, formFields, showMessage } from "./api.js";
++
++export function setupCrud({ noun, load, create, update, remove, renderRow, beforeSubmit }) {
++  const form = document.getElementById("form");
++  const rows = document.getElementById("rows");
++  const message = document.getElementById("message");
++  const formMessage = document.getElementById("form-message");
++  const submit = document.getElementById("submit");
++  const cancel = document.getElementById("cancel");
++  const formTitle = document.getElementById("form-title");
++  const columns = rows.closest("table").querySelectorAll("thead th").length;
++
++  function resetForm() {
++    form.reset();
++    form.elements.id.value = "";
++    formTitle.textContent = `Add a ${noun}`;
++    submit.textContent = `Save ${noun}`;
++    cancel.hidden = true;
++    showMessage(formMessage, "");
++  }
++
++  function edit(item) {
++    for (const [key, value] of Object.entries(item)) {
++      if (form.elements[key]) form.elements[key].value = value ?? "";
++    }
++    formTitle.textContent = `Edit ${item.name}`;
++    submit.textContent = "Save changes";
++    cancel.hidden = false;
++    form.elements.name.focus();
++  }
++
++  async function refresh() {
++    try {
++      const items = await load();
++      rows.replaceChildren();
++      if (items.length === 0) {
++        rows.append(
++          el(
++            "tr",
++            {},
++            el(
++              "td",
++              { colspan: columns, class: "empty-state" },
++              `No ${noun}s yet. Add one with the form.`,
++            ),
++          ),
++        );
++      }
++      for (const item of items) {
++        const actions = el(
++          "td",
++          {},
++          el(
++            "div",
++            { class: "row-actions" },
++            el("button", { type: "button", class: "secondary", onclick: () => edit(item) }, "Edit"),
++            el(
++              "button",
++              {
++                type: "button",
++                class: "danger",
++                onclick: () => onDelete(item),
++                "aria-label": `Delete ${item.name}`,
++              },
++              "Delete",
++            ),
++          ),
++        );
++        rows.append(el("tr", {}, ...renderRow(item), actions));
++      }
++    } catch (error) {
++      showMessage(message, error.message, "error");
++    }
++  }
++
++  async function onDelete(item) {
++    if (!window.confirm(`Delete ${item.name}?`)) return;
++    try {
++      await remove(item.id);
++      showMessage(message, `Deleted ${item.name}.`, "ok");
++      if (form.elements.id.value === String(item.id)) resetForm();
++      await refresh();
++    } catch (error) {
++      showMessage(message, error.message, "error");
++    }
++  }
++
++  form.addEventListener("submit", async (event) => {
++    event.preventDefault();
++    if (!form.reportValidity()) return;
++    const { id, ...data } = formFields(form);
++    if (beforeSubmit) beforeSubmit(data);
++    showMessage(formMessage, "");
++    submit.disabled = true;
++    submit.textContent = "Saving…";
++    try {
++      const saved = id ? await update(id, data) : await create(data);
++      showMessage(message, `Saved ${saved.name}.`, "ok");
++      resetForm();
++      await refresh();
++    } catch (error) {
++      // Next to the form, so it is visible on a phone where the banner is off-screen.
++      showMessage(
++        formMessage,
++        `${error.message.replace(/\.?$/, ".")} Fix the form and save again.`,
++        "error",
++      );
++      submit.textContent = form.elements.id.value ? "Save changes" : `Save ${noun}`;
++    } finally {
++      submit.disabled = false;
++    }
++  });
++  cancel.addEventListener("click", resetForm);
++
++  return { refresh };
++}
+diff -ruN 04-scoring/ui/favicon.svg 05-ui/ui/favicon.svg
+--- 04-scoring/ui/favicon.svg	1970-01-01 01:00:00
++++ 05-ui/ui/favicon.svg	2026-11-22 20:22:44
+@@ -0,0 +1 @@
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" fill="#0f1f29"/><path d="M16 5v18H7z" fill="#f4f6f6"/><path d="M18 9v14h7z" fill="#f4f6f6"/><path d="M5 25h22l-3 3H8z" fill="#0b5d70"/></svg>
+diff -ruN 04-scoring/ui/health.json 05-ui/ui/health.json
+--- 04-scoring/ui/health.json	1970-01-01 01:00:00
++++ 05-ui/ui/health.json	2026-11-22 20:20:26
+@@ -0,0 +1 @@
++{ "status": "ok", "service": "ui" }
+diff -ruN 04-scoring/ui/index.html 05-ui/ui/index.html
+--- 04-scoring/ui/index.html	1970-01-01 01:00:00
++++ 05-ui/ui/index.html	2026-11-22 20:24:25
+@@ -0,0 +1,85 @@
++<!doctype html>
++<html lang="en">
++  <head>
++    <meta charset="utf-8" />
++    <meta name="viewport" content="width=device-width, initial-scale=1" />
++    <meta name="theme-color" content="#0f1f29" />
++    <title>Plan a departure · Passage planner</title>
++    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
++    <link rel="stylesheet" href="styles.css" />
++    <script src="config.js"></script>
++    <script type="module" src="plan.js"></script>
++  </head>
++  <body>
++    <a class="skip" href="#main">Skip to content</a>
++    <header class="site-header">
++      <a class="wordmark" href="index.html" translate="no">Passage planner</a>
++      <nav aria-label="Main">
++        <a href="index.html" aria-current="page">Plan</a>
++        <a href="passages.html">Passages</a>
++        <a href="boats.html">Boats</a>
++      </nav>
++    </header>
++    <main id="main">
++      <h1>When can we leave?</h1>
++      <!-- TODO(team): copy -->
++      <p class="lead">
++        Pick a passage. Every hourly departure in the forecast is checked against your boat’s wind,
++        gust and wave limits.
++      </p>
++      <p class="message" id="message" role="status" aria-live="polite" hidden></p>
++
++      <div class="picker">
++        <div class="field">
++          <label for="passage-select">Passage</label>
++          <select id="passage-select" name="passage">
++            <option value="">Loading passages…</option>
++          </select>
++        </div>
++        <button type="button" id="refresh" class="secondary">Check again</button>
++      </div>
++
++      <div class="split">
++        <section aria-labelledby="timeline-title">
++          <h2 id="timeline-title">Departure windows</h2>
++          <p class="summary" id="summary" aria-live="polite"></p>
++          <div class="timeline" id="timeline"></div>
++          <div class="legend" id="legend" hidden>
++            <span><span class="swatch go"></span>GO</span>
++            <span><span class="swatch nogo"></span>NO-GO</span>
++            <span><span class="swatch empty"></span>Past or beyond forecast</span>
++          </div>
++          <details id="table-details" hidden>
++            <summary>All windows as a table</summary>
++            <div class="table-wrap">
++              <table>
++                <thead>
++                  <tr>
++                    <th scope="col">Departure</th>
++                    <th scope="col">Arrival</th>
++                    <th scope="col">Verdict</th>
++                    <th scope="col">Reason</th>
++                  </tr>
++                </thead>
++                <tbody id="windows-table"></tbody>
++              </table>
++            </div>
++          </details>
++        </section>
++
++        <aside>
++          <section class="panel detail" aria-labelledby="detail-title">
++            <h2 id="detail-title">Selected departure</h2>
++            <div id="detail"><p class="muted">Select an hour on the timeline.</p></div>
++          </section>
++          <section class="panel conditions" aria-labelledby="conditions-title">
++            <h2 id="conditions-title">Conditions now at the start</h2>
++            <div id="conditions">
++              <p class="muted">Pick a passage to see current conditions.</p>
++            </div>
++          </section>
++        </aside>
++      </div>
++    </main>
++  </body>
++</html>
+diff -ruN 04-scoring/ui/passages.html 05-ui/ui/passages.html
+--- 04-scoring/ui/passages.html	1970-01-01 01:00:00
++++ 05-ui/ui/passages.html	2026-11-22 20:24:25
+@@ -0,0 +1,160 @@
++<!doctype html>
++<html lang="en">
++  <head>
++    <meta charset="utf-8" />
++    <meta name="viewport" content="width=device-width, initial-scale=1" />
++    <meta name="theme-color" content="#0f1f29" />
++    <title>Passages · Passage planner</title>
++    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
++    <link rel="stylesheet" href="styles.css" />
++    <script src="config.js"></script>
++    <script type="module" src="passages.js"></script>
++  </head>
++  <body>
++    <a class="skip" href="#main">Skip to content</a>
++    <header class="site-header">
++      <a class="wordmark" href="index.html" translate="no">Passage planner</a>
++      <nav aria-label="Main">
++        <a href="index.html">Plan</a>
++        <a href="passages.html" aria-current="page">Passages</a>
++        <a href="boats.html">Boats</a>
++      </nav>
++    </header>
++    <main id="main">
++      <h1>Passages</h1>
++      <p class="lead">A passage is a start, an end and the speed you expect to average.</p>
++      <p class="message" id="message" role="status" aria-live="polite" hidden></p>
++      <div class="split">
++        <section aria-labelledby="list-title">
++          <h2 id="list-title">Your passages</h2>
++          <div class="table-wrap">
++            <table>
++              <thead>
++                <tr>
++                  <th scope="col">Name</th>
++                  <th scope="col">Boat</th>
++                  <th scope="col">From → to</th>
++                  <th scope="col" class="num">Speed</th>
++                  <th scope="col"><span class="sr-only">Actions</span></th>
++                </tr>
++              </thead>
++              <tbody id="rows"></tbody>
++            </table>
++          </div>
++        </section>
++        <section class="panel" aria-labelledby="form-title">
++          <h2 id="form-title">Add a passage</h2>
++          <form id="form" novalidate>
++            <input type="hidden" name="id" />
++            <div class="field">
++              <label for="name">Name</label>
++              <input
++                id="name"
++                name="name"
++                required
++                maxlength="100"
++                autocomplete="off"
++                placeholder="Barcelona to Sitges…"
++              />
++            </div>
++            <div class="field">
++              <label for="boat_id">Boat</label>
++              <select
++                id="boat_id"
++                name="boat_id"
++                data-type="number"
++                autocomplete="off"
++                required
++              ></select>
++            </div>
++            <div class="field-row">
++              <div class="field">
++                <label for="start_lat">Start latitude</label>
++                <input
++                  id="start_lat"
++                  name="start_lat"
++                  type="number"
++                  autocomplete="off"
++                  inputmode="decimal"
++                  min="-90"
++                  max="90"
++                  step="any"
++                  required
++                  placeholder="41.37…"
++                />
++              </div>
++              <div class="field">
++                <label for="start_lon">Start longitude</label>
++                <input
++                  id="start_lon"
++                  name="start_lon"
++                  type="number"
++                  autocomplete="off"
++                  inputmode="decimal"
++                  min="-180"
++                  max="180"
++                  step="any"
++                  required
++                  placeholder="2.19…"
++                />
++              </div>
++            </div>
++            <div class="field-row">
++              <div class="field">
++                <label for="end_lat">End latitude</label>
++                <input
++                  id="end_lat"
++                  name="end_lat"
++                  type="number"
++                  autocomplete="off"
++                  inputmode="decimal"
++                  min="-90"
++                  max="90"
++                  step="any"
++                  required
++                  placeholder="41.23…"
++                />
++              </div>
++              <div class="field">
++                <label for="end_lon">End longitude</label>
++                <input
++                  id="end_lon"
++                  name="end_lon"
++                  type="number"
++                  autocomplete="off"
++                  inputmode="decimal"
++                  min="-180"
++                  max="180"
++                  step="any"
++                  required
++                  placeholder="1.81…"
++                />
++              </div>
++            </div>
++            <span class="hint">Decimal degrees. North and east are positive.</span>
++            <div class="field">
++              <label for="speed_kn">Planned average speed (kn)</label>
++              <input
++                id="speed_kn"
++                name="speed_kn"
++                type="number"
++                autocomplete="off"
++                inputmode="decimal"
++                min="0.5"
++                max="40"
++                step="0.1"
++                value="6"
++                required
++              />
++            </div>
++            <p class="message" id="form-message" role="alert" hidden></p>
++            <div class="actions">
++              <button type="submit" id="submit">Save passage</button>
++              <button type="button" class="secondary" id="cancel" hidden>Cancel edit</button>
++            </div>
++          </form>
++        </section>
++      </div>
++    </main>
++  </body>
++</html>
+diff -ruN 04-scoring/ui/passages.js 05-ui/ui/passages.js
+--- 04-scoring/ui/passages.js	1970-01-01 01:00:00
++++ 05-ui/ui/passages.js	2026-11-22 20:21:57
+@@ -0,0 +1,42 @@
++import { api, el, showMessage } from "./api.js";
++import { setupCrud } from "./crud.js";
++
++const boatSelect = document.getElementById("boat_id");
++const boatNames = new Map();
++const coord = (lat, lon) => `${lat.toFixed(2)}, ${lon.toFixed(2)}`;
++
++async function loadBoats() {
++  const boats = await api.listBoats();
++  boatSelect.replaceChildren();
++  boatNames.clear();
++  if (boats.length === 0) {
++    boatSelect.append(el("option", { value: "" }, "Add a boat first"));
++    showMessage(
++      document.getElementById("message"),
++      "You need a boat before you can add a passage.",
++      "info",
++    );
++  }
++  for (const boat of boats) {
++    boatNames.set(boat.id, boat.name);
++    boatSelect.append(el("option", { value: boat.id }, boat.name));
++  }
++}
++
++const page = setupCrud({
++  noun: "passage",
++  load: api.listPassages,
++  create: api.createPassage,
++  update: api.updatePassage,
++  remove: api.deletePassage,
++  renderRow: (p) => [
++    el("td", {}, el("a", { href: `index.html?passage=${p.id}` }, p.name)),
++    el("td", {}, boatNames.get(p.boat_id) ?? `#${p.boat_id}`),
++    el("td", {}, `${coord(p.start_lat, p.start_lon)} → ${coord(p.end_lat, p.end_lon)}`),
++    el("td", { class: "num" }, `${p.speed_kn} kn`),
++  ],
++});
++
++loadBoats()
++  .catch((error) => showMessage(document.getElementById("message"), error.message, "error"))
++  .finally(page.refresh);
+diff -ruN 04-scoring/ui/plan.js 05-ui/ui/plan.js
+--- 04-scoring/ui/plan.js	1970-01-01 01:00:00
++++ 05-ui/ui/plan.js	2026-11-22 20:23:55
+@@ -0,0 +1,207 @@
++// Planner page: pick a passage, show the GO/NO-GO timeline and current conditions.
++import { api, el, formatTime, showMessage } from "./api.js";
++
++const $ = (id) => document.getElementById(id);
++const select = $("passage-select");
++const message = $("message");
++let passages = [];
++
++const DAY_FMT = new Intl.DateTimeFormat("en-GB", {
++  weekday: "short",
++  day: "numeric",
++  timeZone: "UTC",
++});
++const DIRS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
++const compass = (deg) =>
++  deg === null || deg === undefined ? "" : ` from ${DIRS[Math.round(deg / 45) % 8]}`;
++const value = (v, unit, digits = 1) =>
++  v === null || v === undefined ? "no data" : `${v.toFixed(digits)} ${unit}`;
++
++async function init() {
++  try {
++    passages = await api.listPassages();
++  } catch (error) {
++    showMessage(message, error.message, "error");
++    select.replaceChildren(el("option", { value: "" }, "Could not load passages"));
++    return;
++  }
++  select.replaceChildren(
++    el("option", { value: "" }, passages.length ? "Choose a passage" : "No passages yet"),
++  );
++  for (const p of passages) select.append(el("option", { value: p.id }, p.name));
++  if (!passages.length) {
++    showMessage(message, "Add a boat and a passage first, then come back here.", "info");
++    return;
++  }
++  const wanted = new URLSearchParams(location.search).get("passage") || passages[0].id;
++  select.value = String(wanted);
++  if (!select.value) select.value = String(passages[0].id);
++  load();
++}
++
++async function load() {
++  const id = Number(select.value);
++  const passage = passages.find((p) => p.id === id);
++  if (!passage) return;
++  history.replaceState(null, "", `?passage=${id}`);
++  showMessage(message, "");
++  $("summary").textContent = "Checking the forecast…";
++  $("timeline").replaceChildren();
++  $("legend").hidden = true;
++  $("table-details").hidden = true;
++  $("detail").replaceChildren(el("p", { class: "muted" }, "Select an hour on the timeline."));
++  loadConditions(passage);
++  try {
++    renderWindows(await api.windows(id));
++  } catch (error) {
++    // 503 "degraded": the forecast service is down. Everything else keeps working.
++    $("summary").textContent = "";
++    showMessage(message, error.message, "error");
++  }
++}
++
++function renderWindows(data) {
++  const { summary, windows } = data;
++  if (data.forecast.stale) {
++    showMessage(
++      message,
++      "The forecast service could not refresh; showing the last saved forecast.",
++      "info",
++    );
++  }
++  $("summary").replaceChildren(
++    el("strong", {}, `${summary.go} of ${summary.windows}`),
++    ` departures are GO. ${data.distance_nm} nm at ${data.speed_kn} kn takes about ${data.duration_h} h. `,
++    summary.first_go
++      ? `First GO: ${formatTime(summary.first_go)}.`
++      : (summary.note ?? "No GO window in the forecast."),
++  );
++  if (!windows.length) return;
++
++  // Group by UTC day; each day is a row of 24 cells, empty where there is no window.
++  const days = new Map();
++  for (const w of windows) {
++    const d = new Date(w.departure);
++    const key = d.toISOString().slice(0, 10);
++    if (!days.has(key)) days.set(key, new Array(24).fill(null));
++    days.get(key)[d.getUTCHours()] = w;
++  }
++  const timeline = $("timeline");
++  timeline.append(
++    el(
++      "div",
++      { class: "hour-scale", "aria-hidden": "true" },
++      el("span"),
++      el("div", {}, ...["00", "06", "12", "18", "23"].map((h) => el("span", {}, h))),
++    ),
++  );
++  for (const [key, hours] of days) {
++    const cells = hours.map((w, hour) => {
++      if (!w) return el("span", { class: "hour" });
++      const label = `${formatTime(w.departure)}: ${w.go ? "GO" : "NO-GO"}`;
++      return el("button", {
++        type: "button",
++        class: `hour ${w.go ? "go" : "nogo"}`,
++        "aria-label": label,
++        "aria-pressed": "false",
++        title: label,
++        "data-hour": hour,
++        onclick: (event) => select_(event.currentTarget, w),
++      });
++    });
++    const label = DAY_FMT.format(new Date(`${key}T00:00:00Z`));
++    timeline.append(
++      el(
++        "div",
++        { class: "day" },
++        el("span", { class: "day-label" }, label),
++        el("div", { class: "hours" }, cells),
++      ),
++    );
++  }
++  $("legend").hidden = false;
++
++  $("windows-table").replaceChildren(
++    ...windows.map((w) =>
++      el(
++        "tr",
++        {},
++        el("td", {}, formatTime(w.departure)),
++        el("td", {}, formatTime(w.arrival)),
++        el(
++          "td",
++          {},
++          el("span", { class: `verdict ${w.go ? "go" : "nogo"}` }, w.go ? "GO" : "NO-GO"),
++        ),
++        el("td", {}, w.reason),
++      ),
++    ),
++  );
++  $("table-details").hidden = false;
++
++  const first = timeline.querySelector("button.hour.go") || timeline.querySelector("button.hour");
++  if (first) first.click();
++}
++
++function select_(button, w) {
++  for (const b of document.querySelectorAll(".hour[aria-pressed='true']"))
++    b.setAttribute("aria-pressed", "false");
++  button.setAttribute("aria-pressed", "true");
++  $("detail").replaceChildren(
++    el("span", { class: `verdict ${w.go ? "go" : "nogo"}` }, w.go ? "GO" : "NO-GO"),
++    w.failures.length
++      ? el("ul", { class: "failures" }, ...w.failures.map((f) => el("li", {}, f.message)))
++      : el("p", { class: "reason" }, w.reason),
++    el(
++      "dl",
++      {},
++      el("dt", {}, "Leave"),
++      el("dd", {}, formatTime(w.departure)),
++      el("dt", {}, "Arrive"),
++      el("dd", {}, formatTime(w.arrival)),
++      el("dt", {}, "Peak wind"),
++      el("dd", {}, value(w.peak.wind_kn, "kn")),
++      el("dt", {}, "Peak gusts"),
++      el("dd", {}, value(w.peak.gust_kn, "kn")),
++      el("dt", {}, "Peak waves"),
++      el("dd", {}, value(w.peak.wave_m, "m", 2)),
++    ),
++  );
++}
++
++async function loadConditions(passage) {
++  const box = $("conditions");
++  box.replaceChildren(el("p", { class: "muted" }, "Loading…"));
++  try {
++    const data = await api.current(passage.start_lat, passage.start_lon);
++    const c = data.current;
++    box.replaceChildren(
++      el("p", { class: "big-number" }, `${value(c.wind_kn, "kn")}${compass(c.wind_dir_deg)}`),
++      el(
++        "dl",
++        {},
++        el("dt", {}, "Gusts"),
++        el("dd", {}, value(c.gust_kn, "kn")),
++        el("dt", {}, "Waves"),
++        el("dd", {}, `${value(c.wave_m, "m", 2)}${compass(c.wave_dir_deg)}`),
++        el("dt", {}, "Wave period"),
++        el("dd", {}, value(c.wave_period_s, "s")),
++        el("dt", {}, "Observed"),
++        el("dd", {}, formatTime(c.time)),
++      ),
++      el(
++        "p",
++        { class: "muted" },
++        data.stale
++          ? "Last saved values: the forecast source is not answering."
++          : "Source: Open-Meteo.",
++      ),
++    );
++  } catch (error) {
++    box.replaceChildren(el("p", {}, `Current conditions unavailable. ${error.message}`));
++  }
++}
++
++select.addEventListener("change", load);
++$("refresh").addEventListener("click", load);
++init();
+diff -ruN 04-scoring/ui/staticwebapp.config.json 05-ui/ui/staticwebapp.config.json
+--- 04-scoring/ui/staticwebapp.config.json	1970-01-01 01:00:00
++++ 05-ui/ui/staticwebapp.config.json	2026-11-22 20:20:26
+@@ -0,0 +1,9 @@
++{
++  "routes": [{ "route": "/health", "rewrite": "/health.json" }],
++  "globalHeaders": {
++    "X-Content-Type-Options": "nosniff",
++    "Referrer-Policy": "strict-origin-when-cross-origin",
++    "Content-Security-Policy": "default-src 'self'; connect-src 'self' https://*.azurecontainerapps.io; img-src 'self' data:; style-src 'self'; script-src 'self'; frame-ancestors 'none'"
++  },
++  "mimeTypes": { ".json": "application/json" }
++}
+diff -ruN 04-scoring/ui/styles.css 05-ui/ui/styles.css
+--- 04-scoring/ui/styles.css	1970-01-01 01:00:00
++++ 05-ui/ui/styles.css	2026-11-22 20:24:36
+@@ -0,0 +1,454 @@
++/* Plain, flat styling on purpose. TODO(team): adjust colours, spacing and copy to taste. */
++:root {
++  --ground: #f4f6f6;
++  --surface: #e6ebec;
++  --ink: #0f1f29;
++  --ink-soft: #46555e;
++  --accent: #0b5d70;
++  --accent-ink: #ffffff;
++  --go: #1e6b3c;
++  --go-soft: #d6eadb;
++  --nogo: #a2281e;
++  --nogo-soft: #f3dad6;
++  --empty: #d3dadc;
++  --focus: #e0a100;
++  --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
++  --gutter: clamp(16px, 4vw, 32px);
++  color-scheme: light;
++}
++
++* {
++  box-sizing: border-box;
++}
++
++[hidden] {
++  display: none !important;
++}
++
++body {
++  margin: 0;
++  background: var(--ground);
++  color: var(--ink);
++  font: 400 1rem/1.5 var(--font);
++  -webkit-font-smoothing: antialiased;
++}
++
++a {
++  color: var(--accent);
++}
++
++:focus-visible {
++  outline: 3px solid var(--focus);
++  outline-offset: 2px;
++}
++
++.skip {
++  position: absolute;
++  left: -999px;
++}
++.sr-only {
++  position: absolute;
++  width: 1px;
++  height: 1px;
++  overflow: hidden;
++  clip-path: inset(50%);
++  white-space: nowrap;
++}
++.skip:focus {
++  left: var(--gutter);
++  top: 8px;
++  background: var(--ink);
++  color: var(--ground);
++  padding: 8px 12px;
++}
++
++/* Header: wordmark, three links */
++.site-header {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: baseline;
++  gap: 8px 32px;
++  padding: 20px var(--gutter);
++  background: var(--ink);
++  color: var(--ground);
++}
++.wordmark {
++  font-weight: 700;
++  font-size: 1.25rem;
++  letter-spacing: -0.01em;
++  color: inherit;
++  text-decoration: none;
++}
++.site-header nav {
++  display: flex;
++  gap: 24px;
++}
++.site-header nav a {
++  color: var(--ground);
++  text-decoration: none;
++  padding: 4px 0;
++  border-bottom: 3px solid transparent;
++}
++.site-header nav a:hover {
++  border-bottom-color: var(--empty);
++}
++.site-header nav a[aria-current="page"] {
++  border-bottom-color: var(--ground);
++}
++
++main {
++  padding: 40px var(--gutter) 96px;
++  max-width: 1200px;
++}
++
++h1 {
++  font-size: clamp(2rem, 5vw, 3rem);
++  line-height: 1.05;
++  letter-spacing: -0.03em;
++  margin: 0 0 8px;
++  text-wrap: balance;
++}
++h2 {
++  text-wrap: balance;
++  font-size: 1.375rem;
++  line-height: 1.2;
++  letter-spacing: -0.01em;
++  margin: 0 0 12px;
++}
++.lead {
++  font-size: 1.125rem;
++  max-width: 60ch;
++  margin: 0 0 32px;
++}
++.muted {
++  color: var(--ink-soft);
++}
++
++section + section {
++  margin-top: 56px;
++}
++aside {
++  display: grid;
++  gap: 16px;
++}
++aside section + section {
++  margin-top: 0;
++}
++
++/* Two-column layout used on every page; stacks on narrow screens */
++.split {
++  display: grid;
++  grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);
++  gap: 40px;
++  align-items: start;
++}
++@media (max-width: 860px) {
++  .split {
++    grid-template-columns: minmax(0, 1fr);
++  }
++}
++
++.panel {
++  background: var(--surface);
++  padding: 24px;
++}
++
++/* Forms */
++form {
++  display: grid;
++  gap: 16px;
++}
++.field {
++  display: grid;
++  gap: 4px;
++}
++.field-row {
++  display: grid;
++  grid-template-columns: 1fr 1fr;
++  gap: 12px;
++}
++label {
++  font-weight: 600;
++  font-size: 0.9375rem;
++}
++.hint {
++  font-size: 0.875rem;
++  color: var(--ink-soft);
++}
++input,
++select {
++  font: inherit;
++  color: var(--ink);
++  background: #fff;
++  border: 1px solid #8a979e;
++  padding: 10px 12px;
++  min-height: 44px;
++  width: 100%;
++}
++
++.actions {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 12px;
++}
++button {
++  font: inherit;
++  font-weight: 600;
++  min-height: 44px;
++  padding: 10px 18px;
++  border: 0;
++  cursor: pointer;
++  background: var(--accent);
++  color: var(--accent-ink);
++  touch-action: manipulation;
++  -webkit-tap-highlight-color: transparent;
++}
++button:hover {
++  background: #084a5a;
++}
++button:active {
++  transform: translateY(1px);
++}
++button.secondary {
++  background: var(--empty);
++  color: var(--ink);
++}
++button.secondary:hover {
++  background: #c2cbce;
++}
++button.danger {
++  background: transparent;
++  color: var(--nogo);
++  padding: 10px 8px;
++}
++button.danger:hover {
++  background: var(--nogo-soft);
++}
++button:disabled {
++  opacity: 0.6;
++  cursor: progress;
++}
++
++/* Status messages */
++.message {
++  padding: 12px 16px;
++  margin: 0 0 24px;
++  background: var(--surface);
++}
++form .message {
++  margin: 0;
++}
++.message[data-kind="error"] {
++  background: var(--nogo-soft);
++  color: #6d1912;
++}
++.message[data-kind="ok"] {
++  background: var(--go-soft);
++  color: #12452a;
++}
++
++/* Tables (real tables keep their lines) */
++.table-wrap {
++  overflow-x: auto;
++}
++table {
++  width: 100%;
++  border-collapse: collapse;
++  font-variant-numeric: tabular-nums;
++}
++th,
++td {
++  text-align: left;
++  padding: 10px 12px 10px 0;
++  border-bottom: 1px solid #c8d0d3;
++  vertical-align: top;
++  overflow-wrap: anywhere;
++}
++th {
++  font-size: 0.875rem;
++  color: var(--ink-soft);
++  font-weight: 600;
++}
++td.num,
++th.num {
++  text-align: right;
++  white-space: nowrap;
++}
++.failures {
++  margin: 12px 0 0;
++  padding-left: 20px;
++}
++.failures li + li {
++  margin-top: 6px;
++}
++.row-actions {
++  display: flex;
++  gap: 4px;
++  justify-content: flex-end;
++}
++.empty-state {
++  padding: 24px 0;
++  color: var(--ink-soft);
++}
++
++/* Planner */
++.picker {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 12px;
++  align-items: end;
++  margin-bottom: 24px;
++}
++.picker .field {
++  min-width: min(100%, 320px);
++}
++.summary {
++  font-size: 1.125rem;
++  margin: 0 0 20px;
++}
++.summary strong {
++  font-size: 2rem;
++  letter-spacing: -0.02em;
++}
++
++/* Timeline: one row per day, 24 hourly cells */
++.timeline {
++  display: grid;
++  gap: 6px;
++}
++.day {
++  display: grid;
++  grid-template-columns: 88px minmax(0, 1fr);
++  gap: 8px;
++  align-items: center;
++}
++.day-label {
++  font-size: 0.875rem;
++  font-weight: 600;
++}
++.hours {
++  display: grid;
++  grid-template-columns: repeat(24, minmax(0, 1fr));
++  gap: 2px;
++}
++.hour {
++  min-height: 36px;
++  padding: 0;
++  background: var(--empty);
++}
++.hour.go {
++  background: var(--go);
++}
++.hour.nogo {
++  background: var(--nogo);
++}
++.hour:hover {
++  opacity: 0.8;
++}
++.hour[aria-pressed="true"] {
++  outline: 3px solid var(--ink);
++  outline-offset: 1px;
++}
++.hour-scale {
++  display: grid;
++  grid-template-columns: 88px minmax(0, 1fr);
++  gap: 8px;
++  font-size: 0.8125rem;
++  color: var(--ink-soft);
++}
++.hour-scale div {
++  display: flex;
++  justify-content: space-between;
++}
++.legend {
++  display: flex;
++  gap: 20px;
++  font-size: 0.875rem;
++  margin-top: 12px;
++}
++.swatch {
++  display: inline-block;
++  width: 14px;
++  height: 14px;
++  vertical-align: -2px;
++  margin-right: 6px;
++}
++.swatch.go {
++  background: var(--go);
++}
++.swatch.nogo {
++  background: var(--nogo);
++}
++.swatch.empty {
++  background: var(--empty);
++}
++
++.verdict {
++  display: inline-block;
++  font-weight: 700;
++  padding: 2px 10px;
++}
++.verdict.go {
++  background: var(--go-soft);
++  color: var(--go);
++}
++.verdict.nogo {
++  background: var(--nogo-soft);
++  color: var(--nogo);
++}
++.detail dl,
++.conditions dl {
++  display: grid;
++  grid-template-columns: auto 1fr;
++  gap: 6px 16px;
++  margin: 16px 0 0;
++}
++dt {
++  color: var(--ink-soft);
++}
++dd {
++  margin: 0;
++  font-variant-numeric: tabular-nums;
++}
++.reason {
++  margin: 12px 0 0;
++}
++.big-number {
++  margin: 0;
++  font-size: 1.75rem;
++  font-weight: 700;
++  letter-spacing: -0.02em;
++}
++
++details {
++  margin-top: 32px;
++}
++summary {
++  cursor: pointer;
++  font-weight: 600;
++  min-height: 44px;
++  display: flex;
++  align-items: center;
++}
++
++@media (max-width: 600px) {
++  .day,
++  .hour-scale {
++    grid-template-columns: 56px minmax(0, 1fr);
++  }
++  .hour {
++    min-height: 28px;
++  }
++  .field-row {
++    grid-template-columns: 1fr;
++  }
++}
++
++@media (prefers-reduced-motion: reduce) {
++  * {
++    transition: none !important;
++  }
++  button:active {
++    transform: none;
++  }
++}

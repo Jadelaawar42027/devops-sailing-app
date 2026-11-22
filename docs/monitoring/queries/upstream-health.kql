@@ -1,0 +1,13 @@
+// Dependency health: calls from the API to the forecast service, and from the forecast
+// service to Open-Meteo. status is empty when the call timed out or could not connect.
+union isfuzzy=true
+    (ContainerAppConsoleLogs_CL | project TimeGenerated, Line = Log_s),
+    (ContainerAppConsoleLogs | project TimeGenerated, Line = Log)
+| where Line startswith "{"
+| extend j = parse_json(Line)
+| where tostring(j.msg) == "upstream call"
+| extend upstream = tostring(j.upstream), status = toint(j.status), duration_ms = todouble(j.duration_ms)
+| where TimeGenerated > ago(24h)
+| summarize calls = count(), failures = countif(isnull(status) or status >= 400),
+            p95_ms = round(percentile(duration_ms, 95), 1) by bin(TimeGenerated, 15m), upstream
+| order by TimeGenerated desc

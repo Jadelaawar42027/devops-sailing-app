@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0f1f29" />
+    <title>Plan a departure · Passage planner</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="config.js"></script>
+    <script type="module" src="plan.js"></script>
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <header class="site-header">
+      <a class="wordmark" href="index.html" translate="no">Passage planner</a>
+      <nav aria-label="Main">
+        <a href="index.html" aria-current="page">Plan</a>
+        <a href="passages.html">Passages</a>
+        <a href="boats.html">Boats</a>
+      </nav>
+    </header>
+    <main id="main">
+      <h1>When can we leave?</h1>
+      <!-- TODO(team): copy -->
+      <p class="lead">
+        Pick a passage. Every hourly departure in the forecast is checked against your boat’s wind,
+        gust and wave limits.
+      </p>
+      <p class="message" id="message" role="status" aria-live="polite" hidden></p>
+
+      <div class="picker">
+        <div class="field">
+          <label for="passage-select">Passage</label>
+          <select id="passage-select" name="passage">
+            <option value="">Loading passages…</option>
+          </select>
+        </div>
+        <button type="button" id="refresh" class="secondary">Check again</button>
+      </div>
+
+      <div class="split">
+        <section aria-labelledby="timeline-title">
+          <h2 id="timeline-title">Departure windows</h2>
+          <p class="summary" id="summary" aria-live="polite"></p>
+          <div class="timeline" id="timeline"></div>
+          <div class="legend" id="legend" hidden>
+            <span><span class="swatch go"></span>GO</span>
+            <span><span class="swatch nogo"></span>NO-GO</span>
+            <span><span class="swatch empty"></span>Past or beyond forecast</span>
+          </div>
+          <details id="table-details" hidden>
+            <summary>All windows as a table</summary>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th scope="col">Departure</th>
+                    <th scope="col">Arrival</th>
+                    <th scope="col">Verdict</th>
+                    <th scope="col">Reason</th>
+                  </tr>
+                </thead>
+                <tbody id="windows-table"></tbody>
+              </table>
+            </div>
+          </details>
+        </section>
+
+        <aside>
+          <section class="panel detail" aria-labelledby="detail-title">
+            <h2 id="detail-title">Selected departure</h2>
+            <div id="detail"><p class="muted">Select an hour on the timeline.</p></div>
+          </section>
+          <section class="panel conditions" aria-labelledby="conditions-title">
+            <h2 id="conditions-title">Conditions now at the start</h2>
+            <div id="conditions">
+              <p class="muted">Pick a passage to see current conditions.</p>
+            </div>
+          </section>
+        </aside>
+      </div>
+    </main>
+  </body>
+</html>

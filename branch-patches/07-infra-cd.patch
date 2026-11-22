@@ -1,0 +1,617 @@
+diff -ruN 06-monitoring/.github/workflows/cd.yml 07-infra-cd/.github/workflows/cd.yml
+--- 06-monitoring/.github/workflows/cd.yml	1970-01-01 01:00:00
++++ 07-infra-cd/.github/workflows/cd.yml	2026-11-22 20:30:40
+@@ -0,0 +1,159 @@
++# CD (brief §5): on merge to main, run CI, push SHA-tagged images to GHCR, apply the
++# infrastructure (Bicep) with the new images, deploy the UI to Static Web Apps, and fail the
++# run if /health does not return 200 in time. Migrations run on service startup.
++#
++# Azure login is OpenID Connect: no client secret or credentials JSON is stored anywhere.
++# Setup (one time): docs/azure-setup.md.
++name: CD
++
++on:
++  push:
++    branches: [main]
++  workflow_dispatch:
++
++permissions:
++  contents: read
++
++concurrency:
++  group: cd-production
++  cancel-in-progress: false
++
++env:
++  PREFIX: ${{ vars.GROUP_PREFIX }}                 # e.g. sdd-3a-g3
++  RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }} # e.g. rg-sdd-3a-g3
++
++jobs:
++  ci:
++    uses: ./.github/workflows/ci.yml
++
++  images:
++    name: Push ${{ matrix.service }} image
++    needs: ci
++    runs-on: ubuntu-latest
++    permissions:
++      contents: read
++      packages: write
++    strategy:
++      matrix:
++        service: [api, forecast]
++    steps:
++      - uses: actions/checkout@v4
++      - uses: docker/setup-buildx-action@v3
++      - uses: docker/login-action@v3
++        with:
++          registry: ghcr.io
++          username: ${{ github.actor }}
++          password: ${{ secrets.GITHUB_TOKEN }}
++      - name: Image name (GHCR needs lowercase)
++        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/${{ matrix.service }}" >> "$GITHUB_ENV"
++      - name: Build and push ${{ github.sha }}
++        uses: docker/build-push-action@v6
++        with:
++          context: services/${{ matrix.service }}
++          push: true
++          tags: ${{ env.IMAGE }}:${{ github.sha }}
++          labels: |
++            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
++            org.opencontainers.image.revision=${{ github.sha }}
++          cache-from: type=gha,scope=${{ matrix.service }}
++          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
++
++  deploy:
++    name: Deploy to Azure
++    needs: images
++    runs-on: ubuntu-latest
++    permissions:
++      contents: read
++      id-token: write # OIDC token for azure/login
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Check configuration
++        run: |
++          for v in GROUP_PREFIX AZURE_RESOURCE_GROUP AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID; do
++            [ -n "${!v}" ] || { echo "::error::GitHub variable $v is not set (see docs/azure-setup.md)"; exit 1; }
++          done
++          [ -n "$SQL_ADMIN_PASSWORD" ] || { echo "::error::GitHub secret SQL_ADMIN_PASSWORD is not set"; exit 1; }
++        env:
++          GROUP_PREFIX: ${{ vars.GROUP_PREFIX }}
++          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
++          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
++          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
++          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
++          SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
++
++      - name: Azure login (OIDC)
++        uses: azure/login@v2
++        with:
++          client-id: ${{ vars.AZURE_CLIENT_ID }}
++          tenant-id: ${{ vars.AZURE_TENANT_ID }}
++          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
++
++      - name: Apply infrastructure and deploy both services (Bicep)
++        id: infra
++        env:
++          SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
++          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
++        run: |
++          IMAGE_BASE="ghcr.io/${GITHUB_REPOSITORY,,}"
++          az deployment group create \
++            --resource-group "$RESOURCE_GROUP" \
++            --name "cd-${GITHUB_RUN_NUMBER}" \
++            --template-file infra/main.bicep \
++            --parameters prefix="$PREFIX" \
++                         apiImage="$IMAGE_BASE/api:$GITHUB_SHA" \
++                         forecastImage="$IMAGE_BASE/forecast:$GITHUB_SHA" \
++                         appVersion="$GITHUB_SHA" \
++                         sqlAdminPassword="$SQL_ADMIN_PASSWORD" \
++                         ghcrUsername="${{ github.repository_owner }}" \
++                         ghcrToken="$GHCR_PULL_TOKEN" \
++            --query properties.outputs -o json > outputs.json
++          for key in apiUrl forecastUrl uiUrl; do
++            echo "$key=$(jq -r ".$key.value" outputs.json)" >> "$GITHUB_OUTPUT"
++          done
++
++      - name: Point the UI at the deployed services
++        run: |
++          cat > ui/config.js <<EOF
++          // Written by the CD pipeline (run ${GITHUB_RUN_NUMBER}, commit ${GITHUB_SHA}).
++          window.APP_CONFIG = {
++            apiUrl: "${{ steps.infra.outputs.apiUrl }}",
++            forecastUrl: "${{ steps.infra.outputs.forecastUrl }}",
++          };
++          EOF
++          cat ui/config.js
++
++      - name: Get the Static Web App deploy token
++        id: swa
++        run: |
++          token=$(az staticwebapp secrets list --name "$PREFIX-ui" --resource-group "$RESOURCE_GROUP" \
++                  --query properties.apiKey -o tsv)
++          echo "::add-mask::$token"
++          echo "token=$token" >> "$GITHUB_OUTPUT"
++
++      - name: Deploy UI to Static Web Apps
++        uses: Azure/static-web-apps-deploy@v1
++        with:
++          azure_static_web_apps_api_token: ${{ steps.swa.outputs.token }}
++          action: upload
++          app_location: ui
++          skip_app_build: true
++          skip_api_build: true
++
++      - name: Smoke test /health on every component
++        env:
++          API_URL: ${{ steps.infra.outputs.apiUrl }}
++          FORECAST_URL: ${{ steps.infra.outputs.forecastUrl }}
++          UI_URL: ${{ steps.infra.outputs.uiUrl }}
++          EXPECTED_VERSION: ${{ github.sha }}
++        run: scripts/smoke-health.sh
++
++      - name: Summary
++        if: always()
++        run: |
++          {
++            echo "### Deployed ${GITHUB_SHA::7}"
++            echo "- UI: ${{ steps.infra.outputs.uiUrl }}"
++            echo "- API: ${{ steps.infra.outputs.apiUrl }}/docs"
++            echo "- Forecast: ${{ steps.infra.outputs.forecastUrl }}/docs"
++          } >> "$GITHUB_STEP_SUMMARY"
+diff -ruN 06-monitoring/docs/azure-setup.md 07-infra-cd/docs/azure-setup.md
+--- 06-monitoring/docs/azure-setup.md	1970-01-01 01:00:00
++++ 07-infra-cd/docs/azure-setup.md	2026-11-22 20:31:28
+@@ -0,0 +1,119 @@
++# Azure and GitHub setup (one time)
++
++Everything in Azure is declared in [`infra/main.bicep`](../infra/main.bicep) and applied by the CD
++pipeline on every merge to `main`. The steps below are the only manual ones. Replace `<N>` with the
++group number, `<owner>/<repo>` with the GitHub repository. Nothing here creates a resource group.
++
++## 1. Identity for GitHub Actions (OIDC, no secret)
++
++The pipeline logs in to Azure with OpenID Connect. Brief §4 says it uses the group's own identity sent
++by the professor; we expect a user-assigned managed identity `sdd-3a-g<N>-github` (or a service
++principal) with **Contributor on `rg-sdd-3a-g<N>` only**. No client secret or credentials JSON is
++ever stored: GitHub gets a short-lived token for each run.
++
++```bash
++az login
++az account show --query "{subscriptionId:id, tenantId:tenantId}" -o table
++
++# Managed identity: read its client id
++az identity show -g rg-sdd-3a-g<N> -n sdd-3a-g<N>-github --query "{clientId:clientId, principalId:principalId}" -o table
++
++# Trust GitHub Actions runs on main of our repo (one federated credential)
++az identity federated-credential create \
++  --name github-main \
++  --identity-name sdd-3a-g<N>-github \
++  --resource-group rg-sdd-3a-g<N> \
++  --issuer https://token.actions.githubusercontent.com \
++  --subject repo:<owner>/<repo>:ref:refs/heads/main \
++  --audiences api://AzureADTokenExchange
++```
++
++If the professor sent an **app registration / service principal** instead of a managed identity,
++the federated credential goes on the app (needs owner rights on the app; ask the professor if denied):
++
++```bash
++az ad app federated-credential create --id <application-client-id> --parameters '{
++  "name": "github-main",
++  "issuer": "https://token.actions.githubusercontent.com",
++  "subject": "repo:<owner>/<repo>:ref:refs/heads/main",
++  "audiences": ["api://AzureADTokenExchange"]
++}'
++```
++
++Only if the identity has no role yet (needs Owner or User Access Administrator, so probably the
++professor runs it):
++
++```bash
++az role assignment create --assignee <principalId> --role Contributor \
++  --scope /subscriptions/<subscriptionId>/resourceGroups/rg-sdd-3a-g<N>
++```
++
++## 2. GitHub variables and secrets
++
++Repository → Settings → Secrets and variables → Actions. With the GitHub CLI:
++
++```bash
++gh variable set GROUP_PREFIX          --body "sdd-3a-g<N>"
++gh variable set AZURE_RESOURCE_GROUP  --body "rg-sdd-3a-g<N>"
++gh variable set AZURE_CLIENT_ID       --body "<clientId from step 1>"
++gh variable set AZURE_TENANT_ID       --body "<tenantId>"
++gh variable set AZURE_SUBSCRIPTION_ID --body "<subscriptionId>"
++
++# SQL admin password: generated locally, typed into the prompt, never written to a file.
++openssl rand -base64 24   # copy the output, add e.g. "Aa1!" for the complexity rules
++gh secret set SQL_ADMIN_PASSWORD      # paste when prompted
++```
++
++Container images: either make the two GHCR packages **public** after the first push
++(GitHub → your profile/org → Packages → `api` and `forecast` → Package settings → Change visibility),
++or create a classic token with only `read:packages` and store it as a secret:
++
++```bash
++gh secret set GHCR_PULL_TOKEN         # optional; only for private packages
++```
++
++## 3. Branch protection (brief §2)
++
++```bash
++gh api -X PUT repos/<owner>/<repo>/branches/main/protection --input - <<'JSON'
++{
++  "required_status_checks": { "strict": true, "contexts": [
++    "api - lint, format, tests", "forecast - lint, format, tests",
++    "ui - format check and syntax", "api - image build", "forecast - image build"] },
++  "enforce_admins": true,
++  "required_pull_request_reviews": { "required_approving_review_count": 1 },
++  "restrictions": null
++}
++JSON
++```
++
++## 4. Optional: preview before the first deploy (read-only)
++
++```bash
++az deployment group what-if -g rg-sdd-3a-g<N> -f infra/main.bicep \
++  -p prefix=sdd-3a-g<N> \
++     apiImage=mcr.microsoft.com/k8se/quickstart:latest \
++     forecastImage=mcr.microsoft.com/k8se/quickstart:latest \
++     sqlAdminPassword='<the same password>'
++```
++
++## 5. First deploy
++
++Merge to `main` (or run the CD workflow by hand: Actions → CD → Run workflow). The run creates all
++resources the first time (about 10 minutes, mostly SQL), then only updates them. The run summary
++prints the three URLs; copy them into the README.
++
++## What gets created
++
++| Resource | Name |
++| --- | --- |
++| Log Analytics workspace (+ saved dashboard/SLO queries) | `sdd-3a-g<N>-logs` |
++| Container Apps environment (Consumption) | `sdd-3a-g<N>-env` |
++| Container App, API (min 0, max 1 replica) | `sdd-3a-g<N>-api` |
++| Container App, forecast (min 0, max 1 replica) | `sdd-3a-g<N>-forecast` |
++| Azure SQL logical server | `sdd-3a-g<N>-sql` |
++| Serverless database, API (auto-pause 60 min) | `sdd-3a-g<N>-api-db` |
++| Serverless database, forecast (auto-pause 60 min) | `sdd-3a-g<N>-forecast-db` |
++| Static Web App (Free) | `sdd-3a-g<N>-ui` |
++
++CI never touches the Azure databases; tests use SQLite and local runs use SQL Server in compose.
+diff -ruN 06-monitoring/infra/README.md 07-infra-cd/infra/README.md
+--- 06-monitoring/infra/README.md	1970-01-01 01:00:00
++++ 07-infra-cd/infra/README.md	2026-11-22 20:31:28
+@@ -0,0 +1,7 @@
++# Infrastructure as code
++
++`main.bicep` declares every Azure resource of the group (see the table in
++[docs/azure-setup.md](../docs/azure-setup.md)). The CD pipeline applies it on every merge to `main`
++with the new image tags, so the deployed state always matches the repository.
++
++Check locally (no Azure access needed): `az bicep build --file infra/main.bicep`.
+diff -ruN 06-monitoring/infra/main.bicep 07-infra-cd/infra/main.bicep
+--- 06-monitoring/infra/main.bicep	1970-01-01 01:00:00
++++ 07-infra-cd/infra/main.bicep	2026-11-22 20:30:07
+@@ -0,0 +1,196 @@
++// All Azure resources of the group, in the existing resource group rg-sdd-<class>-g<N> (brief §4).
++// Applied by the CD pipeline on every merge to main, so nothing is changed by hand.
++//   2 Container Apps, 2 serverless SQL databases (one per service), 1 Static Web App,
++//   plus what they need: the Container Apps environment, its Log Analytics workspace, a SQL server.
++targetScope = 'resourceGroup'
++
++@description('Group prefix, e.g. sdd-3a-g3. Every resource name starts with it.')
++param prefix string
++
++param location string = resourceGroup().location
++
++@description('Static Web Apps is only offered in a few regions.')
++param uiLocation string = 'westeurope'
++
++@description('Full image references, e.g. ghcr.io/org/repo/api:<sha>')
++param apiImage string
++param forecastImage string
++
++@description('Shown by /health; the CD pipeline passes the commit SHA.')
++param appVersion string = 'manual'
++
++param sqlAdminLogin string = 'sailingadmin'
++
++@secure()
++@description('From the GitHub secret SQL_ADMIN_PASSWORD. Never stored in the repository.')
++param sqlAdminPassword string
++
++@description('Only needed if the GHCR packages are private.')
++param ghcrUsername string = ''
++@secure()
++param ghcrToken string = ''
++
++@allowed(['Single', 'Multiple'])
++@description('Multiple = blue-green (scripts/bluegreen.sh). Single = replace the revision in place.')
++param revisionsMode string = 'Single'
++param apiStableRevision string = ''
++param forecastStableRevision string = ''
++
++// ---------- Monitoring: Log Analytics workspace of the Container Apps environment (§4, §6)
++
++resource logs 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
++  name: '${prefix}-logs'
++  location: location
++  properties: {
++    sku: { name: 'PerGB2018' }
++    retentionInDays: 30
++    workspaceCapping: { dailyQuotaGb: 1 } // keeps a runaway log loop from costing money
++  }
++}
++
++// The dashboard and SLO queries, deployed as saved searches (single source: docs/monitoring/queries).
++var savedQueries = [
++  { id: 'request-count', name: 'Request count', query: loadTextContent('../docs/monitoring/queries/request-count.kql') }
++  { id: 'error-rate', name: 'Error rate', query: loadTextContent('../docs/monitoring/queries/error-rate.kql') }
++  { id: 'response-time', name: 'Response time', query: loadTextContent('../docs/monitoring/queries/response-time.kql') }
++  { id: 'slo-windows', name: 'SLO - windows', query: loadTextContent('../docs/monitoring/queries/slo-windows.kql') }
++  { id: 'slo-windows-trend', name: 'SLO - windows trend', query: loadTextContent('../docs/monitoring/queries/slo-windows-trend.kql') }
++  { id: 'upstream-health', name: 'Upstream health', query: loadTextContent('../docs/monitoring/queries/upstream-health.kql') }
++  { id: 'top-routes', name: 'Top routes', query: loadTextContent('../docs/monitoring/queries/top-routes.kql') }
++  { id: 'recent-errors', name: 'Recent errors', query: loadTextContent('../docs/monitoring/queries/recent-errors.kql') }
++]
++
++resource searches 'Microsoft.OperationalInsights/workspaces/savedSearches@2020-08-01' = [
++  for q in savedQueries: {
++    parent: logs
++    name: 'sailing-${q.id}'
++    properties: {
++      category: 'Sailing planner'
++      displayName: q.name
++      query: q.query
++      version: 2
++    }
++  }
++]
++
++resource environment 'Microsoft.App/managedEnvironments@2024-03-01' = {
++  name: '${prefix}-env'
++  location: location
++  properties: {
++    appLogsConfiguration: {
++      destination: 'log-analytics'
++      logAnalyticsConfiguration: {
++        customerId: logs.properties.customerId
++        sharedKey: logs.listKeys().primarySharedKey
++      }
++    }
++  }
++}
++
++// ---------- Data: one serverless database per service, auto-pause after 1 h (§3a, §4)
++
++resource sql 'Microsoft.Sql/servers@2023-08-01-preview' = {
++  name: '${prefix}-sql'
++  location: location
++  properties: {
++    administratorLogin: sqlAdminLogin
++    administratorLoginPassword: sqlAdminPassword
++    minimalTlsVersion: '1.2'
++    publicNetworkAccess: 'Enabled'
++  }
++}
++
++// Container Apps (Consumption) have no fixed outbound IP: allow Azure services only.
++resource allowAzure 'Microsoft.Sql/servers/firewallRules@2023-08-01-preview' = {
++  parent: sql
++  name: 'AllowAzureServices'
++  properties: { startIpAddress: '0.0.0.0', endIpAddress: '0.0.0.0' }
++}
++
++var databaseNames = { api: '${prefix}-api-db', forecast: '${prefix}-forecast-db' }
++
++resource databases 'Microsoft.Sql/servers/databases@2023-08-01-preview' = [
++  for db in items(databaseNames): {
++    parent: sql
++    name: db.value
++    location: location
++    sku: { name: 'GP_S_Gen5', tier: 'GeneralPurpose', family: 'Gen5', capacity: 1 }
++    properties: {
++      autoPauseDelay: 60
++      minCapacity: json('0.5')
++      zoneRedundant: false
++      requestedBackupStorageRedundancy: 'Local'
++    }
++  }
++]
++
++// ---------- UI: one Static Web App per group (§4)
++
++resource ui 'Microsoft.Web/staticSites@2023-12-01' = {
++  name: '${prefix}-ui'
++  location: uiLocation
++  sku: { name: 'Free', tier: 'Free' }
++  properties: {}
++}
++
++// ---------- The two services
++
++var registries = empty(ghcrToken) ? [] : [
++  { server: 'ghcr.io', username: ghcrUsername, passwordSecretRef: 'ghcr-token' }
++]
++var registrySecrets = empty(ghcrToken) ? [] : [{ name: 'ghcr-token', value: ghcrToken }]
++var secrets = concat([{ name: 'db-password', value: sqlAdminPassword }], registrySecrets)
++
++func commonEnv(version string, origin string, dbHost string, dbName string, dbUser string) array => [
++  { name: 'APP_VERSION', value: version }
++  { name: 'LOG_LEVEL', value: 'INFO' }
++  { name: 'CORS_ORIGINS', value: origin }
++  { name: 'DB_HOST', value: dbHost }
++  { name: 'DB_NAME', value: dbName }
++  { name: 'DB_USER', value: dbUser }
++  { name: 'DB_PASSWORD', secretRef: 'db-password' }
++]
++
++var uiOrigin = 'https://${ui.properties.defaultHostname}'
++
++module forecastApp 'modules/containerapp.bicep' = {
++  name: 'forecast-app'
++  dependsOn: [databases]
++  params: {
++    name: '${prefix}-forecast'
++    location: location
++    environmentId: environment.id
++    image: forecastImage
++    secrets: secrets
++    registries: registries
++    revisionsMode: revisionsMode
++    stableRevision: forecastStableRevision
++    env: commonEnv(appVersion, uiOrigin, sql.properties.fullyQualifiedDomainName, databaseNames.forecast, sqlAdminLogin)
++  }
++}
++
++module apiApp 'modules/containerapp.bicep' = {
++  name: 'api-app'
++  dependsOn: [databases]
++  params: {
++    name: '${prefix}-api'
++    location: location
++    environmentId: environment.id
++    image: apiImage
++    secrets: secrets
++    registries: registries
++    revisionsMode: revisionsMode
++    stableRevision: apiStableRevision
++    env: concat(
++      commonEnv(appVersion, uiOrigin, sql.properties.fullyQualifiedDomainName, databaseNames.api, sqlAdminLogin),
++      [{ name: 'FORECAST_URL', value: 'https://${forecastApp.outputs.fqdn}' }]
++    )
++  }
++}
++
++output apiUrl string = 'https://${apiApp.outputs.fqdn}'
++output forecastUrl string = 'https://${forecastApp.outputs.fqdn}'
++output uiUrl string = uiOrigin
++output apiLatestRevision string = apiApp.outputs.latestRevision
++output forecastLatestRevision string = forecastApp.outputs.latestRevision
++output logAnalyticsWorkspace string = logs.name
+diff -ruN 06-monitoring/infra/modules/containerapp.bicep 07-infra-cd/infra/modules/containerapp.bicep
+--- 06-monitoring/infra/modules/containerapp.bicep	1970-01-01 01:00:00
++++ 07-infra-cd/infra/modules/containerapp.bicep	2026-11-22 20:30:07
+@@ -0,0 +1,71 @@
++// One Container App: Consumption plan, scales to zero, max 1 replica (brief §4).
++@description('Container App name, e.g. sdd-3a-g3-api')
++param name string
++param location string
++param environmentId string
++param image string
++param env array
++param secrets array = []
++param registries array = []
++
++@allowed(['Single', 'Multiple'])
++param revisionsMode string = 'Single'
++
++@description('Blue-green only: the revision that keeps 100% of traffic while a new one is tested.')
++param stableRevision string = ''
++
++var traffic = (revisionsMode == 'Multiple' && !empty(stableRevision))
++  ? [{ revisionName: stableRevision, weight: 100, label: 'blue' }]
++  : [{ latestRevision: true, weight: 100 }]
++
++resource app 'Microsoft.App/containerApps@2024-03-01' = {
++  name: name
++  location: location
++  properties: {
++    managedEnvironmentId: environmentId
++    configuration: {
++      activeRevisionsMode: revisionsMode
++      ingress: {
++        external: true
++        targetPort: 8000
++        transport: 'auto'
++        allowInsecure: false
++        traffic: traffic
++      }
++      secrets: secrets
++      registries: registries
++    }
++    template: {
++      containers: [
++        {
++          name: 'app'
++          image: image
++          resources: { cpu: json('0.25'), memory: '0.5Gi' }
++          env: env
++          probes: [
++            {
++              // Startup can take a while: Azure SQL serverless may need ~1 min to resume.
++              type: 'Startup'
++              httpGet: { path: '/health', port: 8000 }
++              periodSeconds: 10
++              failureThreshold: 30
++            }
++            {
++              type: 'Liveness'
++              httpGet: { path: '/health', port: 8000 }
++              periodSeconds: 30
++            }
++          ]
++        }
++      ]
++      scale: {
++        minReplicas: 0
++        maxReplicas: 1
++        rules: [{ name: 'http', http: { metadata: { concurrentRequests: '20' } } }]
++      }
++    }
++  }
++}
++
++output fqdn string = app.properties.configuration.ingress.fqdn
++output latestRevision string = app.properties.latestRevisionName
+diff -ruN 06-monitoring/scripts/smoke-health.sh 07-infra-cd/scripts/smoke-health.sh
+--- 06-monitoring/scripts/smoke-health.sh	1970-01-01 01:00:00
++++ 07-infra-cd/scripts/smoke-health.sh	2026-11-22 20:30:40
+@@ -0,0 +1,41 @@
++#!/usr/bin/env bash
++# Post-deploy check (brief §5): /health must return 200 on every component in time,
++# otherwise the CD run fails. Also checks that the services run the expected version.
++#
++#   API_URL=... FORECAST_URL=... UI_URL=... [EXPECTED_VERSION=<sha>] scripts/smoke-health.sh
++set -uo pipefail
++
++TIMEOUT_S="${TIMEOUT_S:-300}"   # scale-to-zero cold start + Azure SQL resume can take minutes
++EXPECTED_VERSION="${EXPECTED_VERSION:-}"
++status=0
++
++check() { # name url check_version
++  local name=$1 url=$2 want_version=$3 start body code version
++  start=$(date +%s)
++  while true; do
++    body=$(curl -s -m 30 -w '\n%{http_code}' "$url/health" || true)
++    code=$(echo "$body" | tail -1)
++    body=$(echo "$body" | sed '$d')
++    if [[ "$code" == "200" ]]; then
++      version=$(echo "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version",""))' 2>/dev/null)
++      if [[ "$want_version" == "yes" && -n "$EXPECTED_VERSION" && "$version" != "$EXPECTED_VERSION" ]]; then
++        echo "  ... $name is up but still runs version '$version' (want $EXPECTED_VERSION)"
++      else
++        echo "OK   $name $url/health -> 200 ${version:+(version $version)} after $(( $(date +%s) - start ))s"
++        return 0
++      fi
++    else
++      echo "  ... $name $url/health -> ${code:-no answer}, retrying"
++    fi
++    if (( $(date +%s) - start > TIMEOUT_S )); then
++      echo "FAIL $name did not return 200 within ${TIMEOUT_S}s"
++      return 1
++    fi
++    sleep 10
++  done
++}
++
++check api "${API_URL:?set API_URL}" yes || status=1
++check forecast "${FORECAST_URL:?set FORECAST_URL}" yes || status=1
++check ui "${UI_URL:?set UI_URL}" no || status=1
++exit $status

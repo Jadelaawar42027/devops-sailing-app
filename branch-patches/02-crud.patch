@@ -1,0 +1,928 @@
+diff -ruN 01-ci/docker-compose.yml 02-crud/docker-compose.yml
+--- 01-ci/docker-compose.yml	2026-11-22 20:09:46
++++ 02-crud/docker-compose.yml	2026-11-22 20:13:58
+@@ -1,12 +1,47 @@
+-# Local run: docker compose up --build
++# Local run from a clean clone: docker compose up --build
++#   API       http://localhost:8010   (Swagger at /docs)
++#   Forecast  http://localhost:8011
++#
++# The SA password below is a throwaway for the local container only. It is not used
++# anywhere else; Azure SQL credentials live only in GitHub secrets / Container Apps secrets.
++x-db-env: &db-env
++  DB_HOST: db
++  DB_USER: sa
++  DB_PASSWORD: ${MSSQL_SA_PASSWORD:-LocalDev_Only_Passw0rd}
++  DB_TRUST_CERT: "true"
++  DB_CREATE_IF_MISSING: "true"
++
+ services:
++  db:
++    # Local stand-in for Azure SQL (brief §4: "SQL Server in compose locally").
++    # One SQL Server container hosts one database per service (api, forecast).
++    image: mcr.microsoft.com/mssql/server:2022-CU27-GDR2-ubuntu-22.04
++    platform: linux/amd64
++    environment:
++      ACCEPT_EULA: "Y"
++      MSSQL_PID: Developer
++      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-LocalDev_Only_Passw0rd}
++    volumes:
++      - dbdata:/var/opt/mssql
++    healthcheck:
++      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' -b -o /dev/null"]
++      interval: 5s
++      timeout: 5s
++      retries: 30
++      start_period: 20s
++
+   api:
+     build: ./services/api
+     ports:
+       - "8010:8000"
+     environment:
++      <<: *db-env
++      DB_NAME: api
+       CORS_ORIGINS: http://localhost:8090
+       LOG_LEVEL: INFO
++    depends_on:
++      db:
++        condition: service_healthy
+ 
+   forecast:
+     build: ./services/forecast
+@@ -15,3 +50,6 @@
+     environment:
+       CORS_ORIGINS: http://localhost:8090
+       LOG_LEVEL: INFO
++
++volumes:
++  dbdata:
+diff -ruN 01-ci/services/api/Dockerfile 02-crud/services/api/Dockerfile
+--- 01-ci/services/api/Dockerfile	2026-11-22 20:09:27
++++ 02-crud/services/api/Dockerfile	2026-11-22 20:11:48
+@@ -6,12 +6,26 @@
+     PIP_NO_CACHE_DIR=1 \
+     PIP_DISABLE_PIP_VERSION_CHECK=1
+ 
++# Microsoft ODBC Driver 18 (needed by pyodbc for Azure SQL / SQL Server).
++RUN apt-get update \
++    && apt-get install -y --no-install-recommends curl gnupg ca-certificates \
++    && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
++       | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
++    && echo "deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
++       > /etc/apt/sources.list.d/mssql-release.list \
++    && apt-get update \
++    && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 unixodbc \
++    && apt-get purge -y curl gnupg && apt-get autoremove -y \
++    && rm -rf /var/lib/apt/lists/*
++
+ WORKDIR /app
+ RUN groupadd --system app && useradd --system --gid app --no-create-home app
+ 
+ # Dependencies first (pinned), then only the code the service needs. No "COPY . .".
+ COPY requirements.txt ./
+ RUN pip install -r requirements.txt
++COPY alembic.ini ./
++COPY migrations ./migrations
+ COPY app ./app
+ 
+ USER app
+diff -ruN 01-ci/services/api/alembic.ini 02-crud/services/api/alembic.ini
+--- 01-ci/services/api/alembic.ini	1970-01-01 01:00:00
++++ 02-crud/services/api/alembic.ini	2026-11-22 20:11:17
+@@ -0,0 +1,5 @@
++# Used only to create new migrations from the CLI:
++#   DATABASE_URL=sqlite:///./local.db alembic revision -m "describe change"
++# Migrations are applied automatically on startup (app/db.py).
++[alembic]
++script_location = migrations
+diff -ruN 01-ci/services/api/app/config.py 02-crud/services/api/app/config.py
+--- 01-ci/services/api/app/config.py	2026-11-22 20:09:46
++++ 02-crud/services/api/app/config.py	2026-11-22 20:11:17
+@@ -3,22 +3,65 @@
+ import os
+ from dataclasses import dataclass
+ 
++from sqlalchemy.engine import URL
+ 
++ODBC_DRIVER = "ODBC Driver 18 for SQL Server"
++
++
+ def _csv(value: str) -> list[str]:
+     return [item.strip() for item in value.split(",") if item.strip()]
+ 
+ 
++def _bool(value: str | None, default: bool = False) -> bool:
++    if value is None:
++        return default
++    return value.strip().lower() in {"1", "true", "yes", "on"}
++
++
+ @dataclass(frozen=True)
+ class Settings:
+     service_name: str = "api"
+     version: str = "dev"
+     log_level: str = "INFO"
+     cors_origins: tuple[str, ...] = ("http://localhost:8090",)
++    # A SQLAlchemy URL (string or URL object). SQLite is only used by tests and quick local runs.
++    database_url: str | URL = "sqlite:///./local.db"
++    db_create_if_missing: bool = False
++    db_connect_retries: int = 20
++    db_retry_delay_s: float = 5.0
++    run_migrations: bool = True
+ 
+ 
++def database_url_from_env() -> str | URL:
++    """DATABASE_URL wins; otherwise build an Azure SQL / SQL Server URL from DB_* variables."""
++    if os.getenv("DATABASE_URL"):
++        return os.environ["DATABASE_URL"]
++    host = os.getenv("DB_HOST")
++    if not host:
++        return "sqlite:///./local.db"
++    return URL.create(
++        "mssql+pyodbc",
++        username=os.getenv("DB_USER"),
++        password=os.getenv("DB_PASSWORD"),
++        host=host,
++        port=int(os.getenv("DB_PORT", "1433")),
++        database=os.getenv("DB_NAME", "api"),
++        query={
++            "driver": ODBC_DRIVER,
++            "Encrypt": "yes",
++            # Only true locally (self-signed SQL Server in compose). Azure SQL has a real cert.
++            "TrustServerCertificate": "yes" if _bool(os.getenv("DB_TRUST_CERT")) else "no",
++        },
++    )
++
++
+ def load_settings() -> Settings:
+     return Settings(
+         version=os.getenv("APP_VERSION", "dev"),
+         log_level=os.getenv("LOG_LEVEL", "INFO"),
+         cors_origins=tuple(_csv(os.getenv("CORS_ORIGINS", "http://localhost:8090"))),
++        database_url=database_url_from_env(),
++        db_create_if_missing=_bool(os.getenv("DB_CREATE_IF_MISSING")),
++        db_connect_retries=int(os.getenv("DB_CONNECT_RETRIES", "20")),
++        db_retry_delay_s=float(os.getenv("DB_RETRY_DELAY_S", "5")),
+     )
+diff -ruN 01-ci/services/api/app/db.py 02-crud/services/api/app/db.py
+--- 01-ci/services/api/app/db.py	1970-01-01 01:00:00
++++ 02-crud/services/api/app/db.py	2026-11-22 20:12:00
+@@ -0,0 +1,81 @@
++"""Database engine, sessions and migrations-on-startup (brief §3a: versioned migrations)."""
++
++import logging
++import time
++from collections.abc import Iterator
++from pathlib import Path
++from typing import Annotated
++
++from alembic import command
++from alembic.config import Config
++from fastapi import Depends, Request
++from sqlalchemy import Engine, create_engine, text
++from sqlalchemy.engine import URL, make_url
++from sqlalchemy.orm import Session, sessionmaker
++from sqlalchemy.pool import StaticPool
++
++from app.config import Settings
++
++log = logging.getLogger(__name__)
++MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
++
++
++def make_engine(url: str | URL) -> Engine:
++    url = make_url(url)
++    if url.get_backend_name() == "sqlite":
++        kwargs = {"connect_args": {"check_same_thread": False}}
++        if url.database in (None, "", ":memory:"):
++            kwargs["poolclass"] = StaticPool
++        return create_engine(url, **kwargs)
++    # pool_pre_ping: Azure SQL serverless auto-pauses; drop dead connections instead of failing.
++    return create_engine(url, pool_pre_ping=True, pool_recycle=1800)
++
++
++def create_database_if_missing(url: str | URL) -> None:
++    """Local compose only: SQL Server starts empty, so create the service's database."""
++    url = make_url(url)
++    if url.get_backend_name() != "mssql":
++        return
++    name = url.database
++    master = create_engine(url.set(database="master"), isolation_level="AUTOCOMMIT")
++    try:
++        with master.connect() as conn:
++            conn.execute(text(f"IF DB_ID(N'{name}') IS NULL CREATE DATABASE [{name}]"))
++    finally:
++        master.dispose()
++
++
++def run_migrations(engine: Engine) -> None:
++    cfg = Config()
++    cfg.set_main_option("script_location", str(MIGRATIONS_DIR))
++    with engine.begin() as connection:
++        cfg.attributes["connection"] = connection
++        command.upgrade(cfg, "head")
++
++
++def prepare_database(settings: Settings, engine: Engine) -> None:
++    """Create (local only) and migrate the database, retrying while it wakes up."""
++    for attempt in range(1, settings.db_connect_retries + 1):
++        try:
++            if settings.db_create_if_missing:
++                create_database_if_missing(settings.database_url)
++            run_migrations(engine)
++            log.info("migrations applied", extra={"fields": {"attempt": attempt}})
++            return
++        except Exception as exc:  # any DB error during startup is retried
++            if attempt == settings.db_connect_retries:
++                raise
++            log.warning(
++                "database not ready, retrying",
++                extra={"fields": {"attempt": attempt, "error": type(exc).__name__}},
++            )
++            time.sleep(settings.db_retry_delay_s)
++
++
++def get_session(request: Request) -> Iterator[Session]:
++    factory: sessionmaker[Session] = request.app.state.session_factory
++    with factory() as session:
++        yield session
++
++
++SessionDep = Annotated[Session, Depends(get_session)]
+diff -ruN 01-ci/services/api/app/main.py 02-crud/services/api/app/main.py
+--- 01-ci/services/api/app/main.py	2026-11-22 20:08:53
++++ 02-crud/services/api/app/main.py	2026-11-22 20:11:17
+@@ -1,19 +1,38 @@
+ """App factory. Run with: uvicorn app.main:create_app --factory"""
+ 
+-from fastapi import FastAPI
++import logging
++from contextlib import asynccontextmanager
++
++from fastapi import FastAPI, Request
+ from fastapi.middleware.cors import CORSMiddleware
++from fastapi.responses import JSONResponse
++from sqlalchemy.exc import OperationalError
++from sqlalchemy.orm import sessionmaker
+ 
+ from app.config import Settings, load_settings
++from app.db import make_engine, prepare_database
+ from app.logging_setup import add_request_logging, configure_logging
+-from app.routers import health
++from app.routers import boats, health, passages
+ 
++log = logging.getLogger(__name__)
+ 
++
+ def create_app(settings: Settings | None = None) -> FastAPI:
+     settings = settings or load_settings()
+     configure_logging(settings.service_name, settings.log_level)
++    engine = make_engine(settings.database_url)
+ 
+-    app = FastAPI(title="Sailing Planner API", version=settings.version)
++    @asynccontextmanager
++    async def lifespan(app: FastAPI):
++        if settings.run_migrations:
++            prepare_database(settings, engine)
++        yield
++        engine.dispose()
++
++    app = FastAPI(title="Sailing Planner API", version=settings.version, lifespan=lifespan)
+     app.state.settings = settings
++    app.state.engine = engine
++    app.state.session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+ 
+     # CORS restricted to the UI origin (brief §3a).
+     app.add_middleware(
+@@ -24,5 +43,15 @@
+     )
+     add_request_logging(app)
+ 
++    @app.exception_handler(OperationalError)
++    async def database_unavailable(request: Request, exc: OperationalError):
++        log.warning("database unavailable", extra={"fields": {"error": type(exc).__name__}})
++        return JSONResponse(
++            status_code=503,
++            content={"detail": "Database unavailable, please retry in a few seconds."},
++        )
++
+     app.include_router(health.router)
++    app.include_router(boats.router)
++    app.include_router(passages.router)
+     return app
+diff -ruN 01-ci/services/api/app/models.py 02-crud/services/api/app/models.py
+--- 01-ci/services/api/app/models.py	1970-01-01 01:00:00
++++ 02-crud/services/api/app/models.py	2026-11-22 20:11:17
+@@ -0,0 +1,41 @@
++"""ORM models. The schema itself is owned by the migrations in migrations/versions."""
++
++from datetime import UTC, datetime
++
++from sqlalchemy import DateTime, Float, ForeignKey, Integer, String
++from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
++
++
++def utcnow() -> datetime:
++    return datetime.now(UTC).replace(tzinfo=None)
++
++
++class Base(DeclarativeBase):
++    pass
++
++
++class Boat(Base):
++    __tablename__ = "boats"
++
++    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
++    name: Mapped[str] = mapped_column(String(100))
++    max_wind_kn: Mapped[float] = mapped_column(Float)
++    max_gust_kn: Mapped[float | None] = mapped_column(Float, nullable=True)
++    max_wave_m: Mapped[float] = mapped_column(Float)
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
++    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
++
++
++class Passage(Base):
++    __tablename__ = "passages"
++
++    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
++    boat_id: Mapped[int] = mapped_column(ForeignKey("boats.id"), index=True)
++    name: Mapped[str] = mapped_column(String(100))
++    start_lat: Mapped[float] = mapped_column(Float)
++    start_lon: Mapped[float] = mapped_column(Float)
++    end_lat: Mapped[float] = mapped_column(Float)
++    end_lon: Mapped[float] = mapped_column(Float)
++    speed_kn: Mapped[float] = mapped_column(Float)
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
++    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+diff -ruN 01-ci/services/api/app/routers/boats.py 02-crud/services/api/app/routers/boats.py
+--- 01-ci/services/api/app/routers/boats.py	1970-01-01 01:00:00
++++ 02-crud/services/api/app/routers/boats.py	2026-11-22 20:12:00
+@@ -0,0 +1,58 @@
++from fastapi import APIRouter, HTTPException, Response, status
++from sqlalchemy import select
++from sqlalchemy.orm import Session
++
++from app.db import SessionDep
++from app.models import Boat, Passage
++from app.schemas import BoatIn, BoatOut
++
++router = APIRouter(prefix="/boats", tags=["boats"])
++
++
++def get_boat_or_404(session: Session, boat_id: int) -> Boat:
++    boat = session.get(Boat, boat_id)
++    if boat is None:
++        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Boat {boat_id} not found")
++    return boat
++
++
++@router.get("", response_model=list[BoatOut])
++def list_boats(session: SessionDep):
++    return session.scalars(select(Boat).order_by(Boat.id)).all()
++
++
++@router.post("", response_model=BoatOut, status_code=status.HTTP_201_CREATED)
++def create_boat(body: BoatIn, session: SessionDep):
++    boat = Boat(**body.model_dump())
++    session.add(boat)
++    session.commit()
++    session.refresh(boat)
++    return boat
++
++
++@router.get("/{boat_id}", response_model=BoatOut)
++def get_boat(boat_id: int, session: SessionDep):
++    return get_boat_or_404(session, boat_id)
++
++
++@router.put("/{boat_id}", response_model=BoatOut)
++def update_boat(boat_id: int, body: BoatIn, session: SessionDep):
++    boat = get_boat_or_404(session, boat_id)
++    for key, value in body.model_dump().items():
++        setattr(boat, key, value)
++    session.commit()
++    session.refresh(boat)
++    return boat
++
++
++@router.delete("/{boat_id}", status_code=status.HTTP_204_NO_CONTENT)
++def delete_boat(boat_id: int, session: SessionDep):
++    boat = get_boat_or_404(session, boat_id)
++    in_use = session.scalar(select(Passage.id).where(Passage.boat_id == boat_id).limit(1))
++    if in_use is not None:
++        raise HTTPException(
++            status.HTTP_409_CONFLICT, f"Boat {boat_id} has passages; delete them first"
++        )
++    session.delete(boat)
++    session.commit()
++    return Response(status_code=status.HTTP_204_NO_CONTENT)
+diff -ruN 01-ci/services/api/app/routers/passages.py 02-crud/services/api/app/routers/passages.py
+--- 01-ci/services/api/app/routers/passages.py	1970-01-01 01:00:00
++++ 02-crud/services/api/app/routers/passages.py	2026-11-22 20:12:05
+@@ -0,0 +1,63 @@
++from fastapi import APIRouter, HTTPException, Response, status
++from sqlalchemy import select
++from sqlalchemy.orm import Session
++
++from app.db import SessionDep
++from app.models import Boat, Passage
++from app.schemas import PassageIn, PassageOut
++
++router = APIRouter(prefix="/passages", tags=["passages"])
++
++
++def get_passage_or_404(session: Session, passage_id: int) -> Passage:
++    passage = session.get(Passage, passage_id)
++    if passage is None:
++        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Passage {passage_id} not found")
++    return passage
++
++
++def ensure_boat_exists(session: Session, boat_id: int) -> None:
++    if session.get(Boat, boat_id) is None:
++        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"Boat {boat_id} does not exist")
++
++
++@router.get("", response_model=list[PassageOut])
++def list_passages(session: SessionDep, boat_id: int | None = None):
++    query = select(Passage).order_by(Passage.id)
++    if boat_id is not None:
++        query = query.where(Passage.boat_id == boat_id)
++    return session.scalars(query).all()
++
++
++@router.post("", response_model=PassageOut, status_code=status.HTTP_201_CREATED)
++def create_passage(body: PassageIn, session: SessionDep):
++    ensure_boat_exists(session, body.boat_id)
++    passage = Passage(**body.model_dump())
++    session.add(passage)
++    session.commit()
++    session.refresh(passage)
++    return passage
++
++
++@router.get("/{passage_id}", response_model=PassageOut)
++def get_passage(passage_id: int, session: SessionDep):
++    return get_passage_or_404(session, passage_id)
++
++
++@router.put("/{passage_id}", response_model=PassageOut)
++def update_passage(passage_id: int, body: PassageIn, session: SessionDep):
++    passage = get_passage_or_404(session, passage_id)
++    ensure_boat_exists(session, body.boat_id)
++    for key, value in body.model_dump().items():
++        setattr(passage, key, value)
++    session.commit()
++    session.refresh(passage)
++    return passage
++
++
++@router.delete("/{passage_id}", status_code=status.HTTP_204_NO_CONTENT)
++def delete_passage(passage_id: int, session: SessionDep):
++    passage = get_passage_or_404(session, passage_id)
++    session.delete(passage)
++    session.commit()
++    return Response(status_code=status.HTTP_204_NO_CONTENT)
+diff -ruN 01-ci/services/api/app/schemas.py 02-crud/services/api/app/schemas.py
+--- 01-ci/services/api/app/schemas.py	1970-01-01 01:00:00
++++ 02-crud/services/api/app/schemas.py	2026-11-22 20:11:17
+@@ -0,0 +1,50 @@
++"""Request/response models with validation (R2)."""
++
++from datetime import datetime
++
++from pydantic import BaseModel, ConfigDict, Field, model_validator
++
++Name = Field(min_length=1, max_length=100)
++
++
++class BoatIn(BaseModel):
++    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
++
++    name: str = Name
++    max_wind_kn: float = Field(gt=0, le=80, description="Max sustained wind, knots")
++    max_gust_kn: float | None = Field(default=None, gt=0, le=100, description="Max gust, knots")
++    max_wave_m: float = Field(gt=0, le=15, description="Max significant wave height, metres")
++
++    @model_validator(mode="after")
++    def gust_not_below_wind(self) -> "BoatIn":
++        if self.max_gust_kn is not None and self.max_gust_kn < self.max_wind_kn:
++            raise ValueError("max_gust_kn must be greater than or equal to max_wind_kn")
++        return self
++
++
++class BoatOut(BoatIn):
++    model_config = ConfigDict(from_attributes=True)
++
++    id: int
++    created_at: datetime
++    updated_at: datetime
++
++
++class PassageIn(BaseModel):
++    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
++
++    name: str = Name
++    boat_id: int = Field(gt=0)
++    start_lat: float = Field(ge=-90, le=90)
++    start_lon: float = Field(ge=-180, le=180)
++    end_lat: float = Field(ge=-90, le=90)
++    end_lon: float = Field(ge=-180, le=180)
++    speed_kn: float = Field(gt=0, le=40, description="Planned average speed, knots")
++
++
++class PassageOut(PassageIn):
++    model_config = ConfigDict(from_attributes=True)
++
++    id: int
++    created_at: datetime
++    updated_at: datetime
+diff -ruN 01-ci/services/api/migrations/env.py 02-crud/services/api/migrations/env.py
+--- 01-ci/services/api/migrations/env.py	1970-01-01 01:00:00
++++ 02-crud/services/api/migrations/env.py	2026-11-22 20:12:00
+@@ -0,0 +1,29 @@
++"""Alembic environment. The app passes an open connection in config.attributes."""
++
++from alembic import context
++from sqlalchemy import engine_from_config, pool
++
++from app.config import database_url_from_env
++
++config = context.config
++
++
++def run() -> None:
++    connection = config.attributes.get("connection")
++    if connection is not None:
++        context.configure(connection=connection)
++        with context.begin_transaction():
++            context.run_migrations()
++        return
++    # CLI usage (alembic revision / upgrade) against DATABASE_URL or DB_* variables.
++    url = database_url_from_env()
++    engine = engine_from_config(
++        {"sqlalchemy.url": url}, prefix="sqlalchemy.", poolclass=pool.NullPool
++    )
++    with engine.connect() as conn:
++        context.configure(connection=conn)
++        with context.begin_transaction():
++            context.run_migrations()
++
++
++run()
+diff -ruN 01-ci/services/api/migrations/script.py.mako 02-crud/services/api/migrations/script.py.mako
+--- 01-ci/services/api/migrations/script.py.mako	1970-01-01 01:00:00
++++ 02-crud/services/api/migrations/script.py.mako	2026-11-22 20:11:17
+@@ -0,0 +1,22 @@
++"""${message}
++
++Revision ID: ${up_revision}
++Revises: ${down_revision | comma,n}
++Create Date: ${create_date}
++"""
++
++import sqlalchemy as sa
++from alembic import op
++
++revision = ${repr(up_revision)}
++down_revision = ${repr(down_revision)}
++branch_labels = None
++depends_on = None
++
++
++def upgrade() -> None:
++    ${upgrades if upgrades else "pass"}
++
++
++def downgrade() -> None:
++    ${downgrades if downgrades else "pass"}
+diff -ruN 01-ci/services/api/migrations/versions/0001_boats_and_passages.py 02-crud/services/api/migrations/versions/0001_boats_and_passages.py
+--- 01-ci/services/api/migrations/versions/0001_boats_and_passages.py	1970-01-01 01:00:00
++++ 02-crud/services/api/migrations/versions/0001_boats_and_passages.py	2026-11-22 20:11:17
+@@ -0,0 +1,47 @@
++"""Create boats and passages.
++
++Revision ID: 0001
++Revises:
++Create Date: 2026-11-22
++"""
++
++import sqlalchemy as sa
++from alembic import op
++
++revision = "0001"
++down_revision = None
++branch_labels = None
++depends_on = None
++
++
++def upgrade() -> None:
++    op.create_table(
++        "boats",
++        sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
++        sa.Column("name", sa.String(100), nullable=False),
++        sa.Column("max_wind_kn", sa.Float, nullable=False),
++        sa.Column("max_gust_kn", sa.Float, nullable=True),
++        sa.Column("max_wave_m", sa.Float, nullable=False),
++        sa.Column("created_at", sa.DateTime, nullable=False),
++        sa.Column("updated_at", sa.DateTime, nullable=False),
++    )
++    op.create_table(
++        "passages",
++        sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
++        sa.Column("boat_id", sa.Integer, sa.ForeignKey("boats.id"), nullable=False),
++        sa.Column("name", sa.String(100), nullable=False),
++        sa.Column("start_lat", sa.Float, nullable=False),
++        sa.Column("start_lon", sa.Float, nullable=False),
++        sa.Column("end_lat", sa.Float, nullable=False),
++        sa.Column("end_lon", sa.Float, nullable=False),
++        sa.Column("speed_kn", sa.Float, nullable=False),
++        sa.Column("created_at", sa.DateTime, nullable=False),
++        sa.Column("updated_at", sa.DateTime, nullable=False),
++    )
++    op.create_index("ix_passages_boat_id", "passages", ["boat_id"])
++
++
++def downgrade() -> None:
++    op.drop_index("ix_passages_boat_id", table_name="passages")
++    op.drop_table("passages")
++    op.drop_table("boats")
+diff -ruN 01-ci/services/api/requirements.in 02-crud/services/api/requirements.in
+--- 01-ci/services/api/requirements.in	2026-11-22 20:08:46
++++ 02-crud/services/api/requirements.in	2026-11-22 20:11:17
+@@ -1,3 +1,6 @@
+ fastapi
+ uvicorn
+ httpx
++sqlalchemy
++alembic
++pyodbc
+diff -ruN 01-ci/services/api/requirements.txt 02-crud/services/api/requirements.txt
+--- 01-ci/services/api/requirements.txt	2026-11-22 20:08:46
++++ 02-crud/services/api/requirements.txt	2026-11-22 20:11:17
+@@ -1,6 +1,8 @@
+ # Pinned runtime dependencies. Regenerate with:
+ #   uv pip compile requirements.in --python-version 3.12 -o requirements.txt
+ annotated-doc==0.0.5
++alembic==1.20.1
++annotated-doc==0.0.5
+ annotated-types==0.8.0
+ anyio==4.16.0
+ certifi==2026.10.23
+@@ -10,9 +12,13 @@
+ httpcore==1.0.9
+ httpx==0.28.1
+ idna==3.20
++mako==1.4.3
++markupsafe==3.0.4
+ opentelemetry-api==1.45.2
+ pydantic==2.14.3
+ pydantic-core==2.50.4
++pyodbc==5.5.0
++sqlalchemy==2.1.8
+ starlette==1.10.0
+ typing-extensions==4.16.0
+ typing-inspection==0.4.5
+diff -ruN 01-ci/services/api/tests/conftest.py 02-crud/services/api/tests/conftest.py
+--- 01-ci/services/api/tests/conftest.py	2026-11-22 20:08:46
++++ 02-crud/services/api/tests/conftest.py	2026-11-22 20:11:48
+@@ -6,11 +6,40 @@
+ 
+ 
+ @pytest.fixture
+-def settings() -> Settings:
+-    return Settings(version="test", cors_origins=("http://ui.test",))
++def settings(tmp_path) -> Settings:
++    # A real SQLite file so the Alembic migrations run exactly as on startup.
++    return Settings(
++        version="test",
++        cors_origins=("http://ui.test",),
++        database_url=f"sqlite:///{tmp_path / 'test.db'}",
++        db_connect_retries=1,
++    )
+ 
+ 
+ @pytest.fixture
+ def client(settings):
+     with TestClient(create_app(settings)) as c:
+         yield c
++
++
++BOAT = {"name": "Aurora", "max_wind_kn": 20, "max_gust_kn": 28, "max_wave_m": 2.0}
++
++
++@pytest.fixture
++def boat(client) -> dict:
++    response = client.post("/boats", json=BOAT)
++    assert response.status_code == 201
++    return response.json()
++
++
++@pytest.fixture
++def passage_body(boat) -> dict:
++    return {
++        "name": "Barcelona to Mallorca",
++        "boat_id": boat["id"],
++        "start_lat": 41.38,
++        "start_lon": 2.18,
++        "end_lat": 39.57,
++        "end_lon": 2.65,
++        "speed_kn": 6,
++    }
+diff -ruN 01-ci/services/api/tests/test_boats.py 02-crud/services/api/tests/test_boats.py
+--- 01-ci/services/api/tests/test_boats.py	1970-01-01 01:00:00
++++ 02-crud/services/api/tests/test_boats.py	2026-11-22 20:11:48
+@@ -0,0 +1,66 @@
++import pytest
++
++from tests.conftest import BOAT
++
++
++def test_create_and_get_boat(client, boat):
++    assert boat["id"] > 0
++    assert boat["name"] == "Aurora"
++    assert client.get(f"/boats/{boat['id']}").json()["max_wave_m"] == 2.0
++
++
++def test_list_boats(client, boat):
++    response = client.get("/boats")
++    assert response.status_code == 200
++    assert [b["id"] for b in response.json()] == [boat["id"]]
++
++
++def test_update_boat(client, boat):
++    body = {**BOAT, "name": "Aurora II", "max_wind_kn": 22}
++    response = client.put(f"/boats/{boat['id']}", json=body)
++    assert response.status_code == 200
++    assert response.json()["name"] == "Aurora II"
++    assert response.json()["max_wind_kn"] == 22
++
++
++def test_delete_boat(client, boat):
++    assert client.delete(f"/boats/{boat['id']}").status_code == 204
++    assert client.get(f"/boats/{boat['id']}").status_code == 404
++
++
++def test_missing_boat_returns_404(client):
++    assert client.get("/boats/999").status_code == 404
++    assert client.put("/boats/999", json=BOAT).status_code == 404
++    assert client.delete("/boats/999").status_code == 404
++
++
++def test_name_is_trimmed_and_gust_optional(client):
++    response = client.post("/boats", json={**BOAT, "name": "  Breeze  ", "max_gust_kn": None})
++    assert response.status_code == 201
++    assert response.json()["name"] == "Breeze"
++    assert response.json()["max_gust_kn"] is None
++
++
++@pytest.mark.parametrize(
++    "change",
++    [
++        {"name": ""},
++        {"name": "x" * 101},
++        {"max_wind_kn": 0},
++        {"max_wind_kn": -5},
++        {"max_wave_m": 0},
++        {"max_wave_m": 99},
++        {"max_gust_kn": 10},  # below max_wind_kn
++        {"unknown": 1},
++    ],
++)
++def test_invalid_boat_is_rejected(client, change):
++    response = client.post("/boats", json={**BOAT, **change})
++    assert response.status_code == 422
++
++
++def test_cannot_delete_boat_with_passages(client, boat, passage_body):
++    assert client.post("/passages", json=passage_body).status_code == 201
++    response = client.delete(f"/boats/{boat['id']}")
++    assert response.status_code == 409
++    assert "passages" in response.json()["detail"]
+diff -ruN 01-ci/services/api/tests/test_db.py 02-crud/services/api/tests/test_db.py
+--- 01-ci/services/api/tests/test_db.py	1970-01-01 01:00:00
++++ 02-crud/services/api/tests/test_db.py	2026-11-22 20:11:48
+@@ -0,0 +1,62 @@
++import pytest
++from sqlalchemy import inspect
++from sqlalchemy.exc import OperationalError
++
++from app import db
++from app.config import Settings, database_url_from_env
++
++
++def test_migrations_create_tables(client):
++    tables = set(inspect(client.app.state.engine).get_table_names())
++    assert {"boats", "passages", "alembic_version"} <= tables
++
++
++def test_migrations_are_idempotent(client):
++    db.run_migrations(client.app.state.engine)  # second run is a no-op
++
++
++def test_prepare_database_retries_then_raises(monkeypatch):
++    calls = []
++
++    def boom(engine):
++        calls.append(1)
++        raise OperationalError("SELECT 1", {}, Exception("paused"))
++
++    monkeypatch.setattr(db, "run_migrations", boom)
++    settings = Settings(db_connect_retries=3, db_retry_delay_s=0)
++    with pytest.raises(OperationalError):
++        db.prepare_database(settings, engine=None)
++    assert len(calls) == 3
++
++
++def test_database_error_returns_503_not_500(client, monkeypatch):
++    def broken(*args, **kwargs):
++        raise OperationalError("SELECT 1", {}, Exception("database paused"))
++
++    monkeypatch.setattr("sqlalchemy.orm.Session.scalars", broken)
++    response = client.get("/boats")
++    assert response.status_code == 503
++    assert "Database unavailable" in response.json()["detail"]
++
++
++def test_database_url_from_env(monkeypatch):
++    monkeypatch.delenv("DATABASE_URL", raising=False)
++    monkeypatch.delenv("DB_HOST", raising=False)
++    assert str(database_url_from_env()).startswith("sqlite")
++
++    monkeypatch.setenv("DB_HOST", "sql.example.net")
++    monkeypatch.setenv("DB_NAME", "apidb")
++    monkeypatch.setenv("DB_USER", "u")
++    monkeypatch.setenv("DB_PASSWORD", "p@ss;word")
++    url = database_url_from_env()
++    assert url.drivername == "mssql+pyodbc"
++    assert url.database == "apidb"
++    assert url.password == "p@ss;word"
++    assert url.query["TrustServerCertificate"] == "no"
++
++    monkeypatch.setenv("DATABASE_URL", "sqlite:///x.db")
++    assert database_url_from_env() == "sqlite:///x.db"
++
++
++def test_create_database_if_missing_ignores_sqlite():
++    db.create_database_if_missing("sqlite:///:memory:")  # no-op, must not raise
+diff -ruN 01-ci/services/api/tests/test_passages.py 02-crud/services/api/tests/test_passages.py
+--- 01-ci/services/api/tests/test_passages.py	1970-01-01 01:00:00
++++ 02-crud/services/api/tests/test_passages.py	2026-11-22 20:11:48
+@@ -0,0 +1,55 @@
++import pytest
++
++
++def test_passage_crud_roundtrip(client, passage_body):
++    created = client.post("/passages", json=passage_body)
++    assert created.status_code == 201
++    pid = created.json()["id"]
++
++    assert client.get(f"/passages/{pid}").json()["name"] == "Barcelona to Mallorca"
++
++    updated = client.put(f"/passages/{pid}", json={**passage_body, "speed_kn": 7.5})
++    assert updated.status_code == 200
++    assert updated.json()["speed_kn"] == 7.5
++
++    assert client.delete(f"/passages/{pid}").status_code == 204
++    assert client.get(f"/passages/{pid}").status_code == 404
++
++
++def test_list_passages_filters_by_boat(client, passage_body):
++    client.post("/passages", json=passage_body)
++    other = client.post("/boats", json={"name": "Other", "max_wind_kn": 15, "max_wave_m": 1}).json()
++    client.post("/passages", json={**passage_body, "boat_id": other["id"], "name": "Other trip"})
++
++    assert len(client.get("/passages").json()) == 2
++    only = client.get(f"/passages?boat_id={other['id']}").json()
++    assert [p["name"] for p in only] == ["Other trip"]
++
++
++def test_passage_for_unknown_boat_is_rejected(client, passage_body):
++    response = client.post("/passages", json={**passage_body, "boat_id": 999})
++    assert response.status_code == 422
++    assert response.json()["detail"] == "Boat 999 does not exist"
++
++
++def test_missing_passage_returns_404(client, passage_body):
++    assert client.get("/passages/999").status_code == 404
++    assert client.put("/passages/999", json=passage_body).status_code == 404
++    assert client.delete("/passages/999").status_code == 404
++
++
++@pytest.mark.parametrize(
++    "change",
++    [
++        {"start_lat": 91},
++        {"end_lat": -91},
++        {"start_lon": 181},
++        {"end_lon": -181},
++        {"speed_kn": 0},
++        {"speed_kn": 41},
++        {"name": ""},
++        {"boat_id": 0},
++    ],
++)
++def test_invalid_passage_is_rejected(client, passage_body, change):
++    assert client.post("/passages", json={**passage_body, **change}).status_code == 422
