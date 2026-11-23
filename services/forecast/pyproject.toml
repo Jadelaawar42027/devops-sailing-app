@@ -1,0 +1,24 @@
+[project]
+name = "sailing-forecast"
+version = "0.1.0"
+description = "Marine forecast and current conditions from Open-Meteo, cached"
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true
