@@ -18,7 +18,7 @@ class BoatIn(BaseModel):
     @model_validator(mode="after")
     def gust_not_below_wind(self) -> "BoatIn":
         if self.max_gust_kn is not None and self.max_gust_kn < self.max_wind_kn:
-            raise ValueError("max_gust_kn must be greater than or equal to max_wind_kn")
+            raise ValueError("Max gust must be at least the max wind")
         return self
 
 

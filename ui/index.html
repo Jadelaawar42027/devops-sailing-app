@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Passage Planner</title>
+    <meta name="theme-color" content="#07111E" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="config.js" defer></script>
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace">Skip to content</a>
+    <header class="site-header">
+      <h1>Passage Planner</h1>
+      <p>Sailing Go/No-Go Planner</p>
+    </header>
+
+    <main id="workspace" tabindex="-1">
+      <section aria-labelledby="passages-title">
+        <h2 id="passages-title">Passages</h2>
+
+        <form id="passage-form" aria-labelledby="passage-form-title">
+          <h3 id="passage-form-title">Plan a passage</h3>
+
+          <div class="form-fields">
+            <div class="field">
+              <label for="passage-boat">Boat</label>
+              <select id="passage-boat" name="boat_id" required disabled>
+                <option value="">No boat selected</option>
+              </select>
+            </div>
+
+            <div class="field">
+              <label for="passage-speed">Cruise speed (kn)</label>
+              <input id="passage-speed" name="speed_kn" type="number" min="0" step="any" required />
+            </div>
+
+            <fieldset class="departure-fields">
+              <legend>Earliest departure</legend>
+              <div class="departure-inputs">
+                <div class="field">
+                  <label for="departure-start-date">Date</label>
+                  <input id="departure-start-date" type="date" required />
+                </div>
+                <div class="field">
+                  <label for="departure-start-time">Time</label>
+                  <input
+                    id="departure-start-time"
+                    type="text"
+                    placeholder="09:00"
+                    aria-describedby="departure-time-hint"
+                    pattern="([01]?[0-9]|2[0-3]):[0-5][0-9]"
+                    maxlength="5"
+                    required
+                  />
+                </div>
+              </div>
+            </fieldset>
+
+            <fieldset class="departure-fields">
+              <legend>Latest departure</legend>
+              <div class="departure-inputs">
+                <div class="field">
+                  <label for="departure-end-date">Date</label>
+                  <input id="departure-end-date" type="date" required />
+                </div>
+                <div class="field">
+                  <label for="departure-end-time">Time</label>
+                  <input
+                    id="departure-end-time"
+                    type="text"
+                    placeholder="12:00"
+                    aria-describedby="departure-time-hint"
+                    pattern="([01]?[0-9]|2[0-3]):[0-5][0-9]"
+                    maxlength="5"
+                    required
+                  />
+                </div>
+              </div>
+            </fieldset>
+
+            <fieldset class="departure-fields">
+              <legend>Start point</legend>
+              <div class="departure-inputs">
+                <div class="field">
+                  <label for="start-lat">Start latitude</label>
+                  <input id="start-lat" type="number" min="-90" max="90" step="any" required />
+                </div>
+                <div class="field">
+                  <label for="start-lon">Start longitude</label>
+                  <input id="start-lon" type="number" min="-180" max="180" step="any" required />
+                </div>
+              </div>
+            </fieldset>
+
+            <fieldset class="departure-fields">
+              <legend>End point</legend>
+              <div class="departure-inputs">
+                <div class="field">
+                  <label for="end-lat">End latitude</label>
+                  <input id="end-lat" type="number" min="-90" max="90" step="any" required />
+                </div>
+                <div class="field">
+                  <label for="end-lon">End longitude</label>
+                  <input id="end-lon" type="number" min="-180" max="180" step="any" required />
+                </div>
+              </div>
+            </fieldset>
+          </div>
+
+          <p id="departure-time-hint" class="field-hint">
+            Use local time in 24-hour format, for example 09:00 or 17:30.
+          </p>
+
+          <p class="section-description">Choose a practice boat. Passage saving is coming later.</p>
+          <button id="check-departure" type="button">Check departure window</button>
+          <p id="departure-result" class="section-description" role="status"></p>
+          <button type="submit" disabled>Save passage</button>
+        </form>
+      </section>
+      <section aria-labelledby="boats-title">
+        <h2 id="boats-title">Boats</h2>
+        <p id="boats-status" class="section-description" role="status">
+          Boat management is being developed. No boat data has been loaded.
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Name</th>
+                <th scope="col">Type</th>
+                <th scope="col">Length (ft)</th>
+                <th scope="col">Max wind (kn)</th>
+                <th scope="col">Max gust (kn)</th>
+                <th scope="col">Max waves (m)</th>
+                <th scope="col">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="boats-body">
+              <tr>
+                <td colspan="7">No data loaded.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <form id="boat-form" aria-labelledby="boat-form-title" novalidate>
+          <h3 id="boat-form-title">Add a boat</h3>
+
+          <div class="form-fields">
+            <div class="field">
+              <label for="boat-name">Name</label>
+              <input id="boat-name" name="name" type="text" maxlength="100" required />
+            </div>
+
+            <div class="field">
+              <label for="boat-type">Boat type</label>
+              <input id="boat-type" name="boat_type" type="text" required />
+            </div>
+
+            <div class="field">
+              <label for="boat-length">Length (ft)</label>
+              <input id="boat-length" name="length_ft" type="number" min="0" step="any" required />
+            </div>
+
+            <div class="field">
+              <label for="boat-wind">Maximum wind (kn)</label>
+              <input id="boat-wind" name="max_wind_kn" type="number" min="0" step="any" required />
+            </div>
+
+            <div class="field">
+              <label for="boat-gust">Maximum gust (kn)</label>
+              <input id="boat-gust" name="max_gust_kn" type="number" min="0" step="any" required />
+            </div>
+
+            <div class="field">
+              <label for="boat-wave">Maximum waves (m)</label>
+              <input id="boat-wave" name="max_wave_m" type="number" min="0" step="any" required />
+            </div>
+          </div>
+
+          <p id="boat-form-message" class="section-description" role="status">
+            Check your details before saving becomes available.
+          </p>
+          <button type="submit">Check boat details</button>
+          <button id="cancel-edit" type="button" class="button-secondary" hidden>
+            Cancel edit
+          </button>
+        </form>
+      </section>
+    </main>
+
+    <footer>
+      <p>Commit: <span id="commit-sha">Not configured</span></p>
+    </footer>
+  </body>
+</html>

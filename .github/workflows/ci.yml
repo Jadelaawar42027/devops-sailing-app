@@ -62,6 +62,19 @@ jobs:
           path: services/${{ matrix.service }}/coverage.xml
           if-no-files-found: ignore
 
+  ui:
+    name: ui - format check and syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Format check (prettier)
+        run: npx --yes prettier@3.3.3 --check ui
+      - name: JavaScript syntax check
+        run: for f in ui/*.js; do node --check "$f"; done
+
   images:
     name: ${{ matrix.service }} - image build
     runs-on: ubuntu-latest
