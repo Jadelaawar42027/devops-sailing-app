@@ -1,0 +1,16 @@
+# Fully pinned (pip freeze on python:3.12). Top-level: fastapi, uvicorn, pydantic-settings, pymssql
+annotated-types==0.8.0
+anyio==4.16.0
+click==8.5.1
+fastapi==0.115.6
+h11==0.16.0
+idna==3.20
+pydantic==2.14.4
+pydantic-settings==2.6.1
+pydantic_core==2.50.5
+pymssql==2.3.2
+python-dotenv==1.2.4
+starlette==0.41.3
+typing-inspection==0.4.5
+typing_extensions==4.16.0
+uvicorn==0.32.1

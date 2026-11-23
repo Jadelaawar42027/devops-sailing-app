@@ -1,0 +1,37 @@
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-CU16-ubuntu-22.04
+    platform: linux/amd64
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-LocalDev_Passw0rd!}
+    ports:
+      - "1434:1433"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          '/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -Q ''SELECT 1'' || exit 1',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  passage-api:
+    build: ./services/passage-api
+    ports:
+      - "8001:8001"
+    environment:
+      DB_CONNECTION_STRING: "Server=sqlserver,1433;Database=passage;User ID=sa;Password=${MSSQL_SA_PASSWORD:-LocalDev_Passw0rd!}"
+      DB_CREATE_IF_MISSING: "true"
+      CORS_ORIGIN: "http://localhost:8080"
+      CONDITIONS_API_URL: "http://conditions-api:8002"
+      CONDITIONS_TIMEOUT_S: "3"
+      LOG_LEVEL: "INFO"
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+
+  # R4 adds conditions-api here (port 8002, its own database on the same SQL Server)
+  # R5 adds the UI here if you want it served locally on 8080
