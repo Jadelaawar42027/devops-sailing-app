@@ -1,12 +1,47 @@
-# Local run: docker compose up --build
+# Local run from a clean clone: docker compose up --build
+#   API       http://localhost:8010   (Swagger at /docs)
+#   Forecast  http://localhost:8011
+#
+# The SA password below is a throwaway for the local container only. It is not used
+# anywhere else; Azure SQL credentials live only in GitHub secrets / Container Apps secrets.
+x-db-env: &db-env
+  DB_HOST: db
+  DB_USER: sa
+  DB_PASSWORD: ${MSSQL_SA_PASSWORD:-LocalDev_Only_Passw0rd}
+  DB_TRUST_CERT: "true"
+  DB_CREATE_IF_MISSING: "true"
+
 services:
+  db:
+    # Local stand-in for Azure SQL (brief §4: "SQL Server in compose locally").
+    # One SQL Server container hosts one database per service (api, forecast).
+    image: mcr.microsoft.com/mssql/server:2022-CU27-GDR2-ubuntu-22.04
+    platform: linux/amd64
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-LocalDev_Only_Passw0rd}
+    volumes:
+      - dbdata:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' -b -o /dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
   api:
     build: ./services/api
     ports:
       - "8010:8000"
     environment:
+      <<: *db-env
+      DB_NAME: api
       CORS_ORIGINS: http://localhost:8090
       LOG_LEVEL: INFO
+    depends_on:
+      db:
+        condition: service_healthy
 
   forecast:
     build: ./services/forecast
@@ -15,3 +50,6 @@ services:
     environment:
       CORS_ORIGINS: http://localhost:8090
       LOG_LEVEL: INFO
+
+volumes:
+  dbdata:
