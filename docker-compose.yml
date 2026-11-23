@@ -48,8 +48,13 @@ services:
     ports:
       - "8011:8000"
     environment:
+      <<: *db-env
+      DB_NAME: forecast
       CORS_ORIGINS: http://localhost:8090
       LOG_LEVEL: INFO
+    depends_on:
+      db:
+        condition: service_healthy
 
 volumes:
   dbdata:
