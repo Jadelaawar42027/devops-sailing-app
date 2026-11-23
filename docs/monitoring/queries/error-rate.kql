@@ -1,0 +1,15 @@
+let Requests = union isfuzzy=true
+    (ContainerAppConsoleLogs_CL | project TimeGenerated, App = ContainerAppName_s, Line = Log_s),
+    (ContainerAppConsoleLogs | project TimeGenerated, App = ContainerAppName, Line = Log)
+| where Line startswith "{"
+| extend j = parse_json(Line)
+| where tostring(j.msg) == "request"
+| extend service = tostring(j.service), method = tostring(j.method), route = tostring(j.route),
+         status = toint(j.status), duration_ms = todouble(j.duration_ms);
+Requests
+| where TimeGenerated > ago(24h)
+| summarize total = count(), errors = countif(status >= 500), client_errors = countif(status between (400 .. 499))
+    by bin(TimeGenerated, 5m), service
+| extend error_rate_pct = round(100.0 * errors / total, 2)
+| project TimeGenerated, service, error_rate_pct, errors, client_errors, total
+| render timechart
