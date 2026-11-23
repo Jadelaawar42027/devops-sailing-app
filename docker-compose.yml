@@ -37,6 +37,7 @@ services:
     environment:
       <<: *db-env
       DB_NAME: api
+      FORECAST_URL: http://forecast:8000
       CORS_ORIGINS: http://localhost:8090
       LOG_LEVEL: INFO
     depends_on:

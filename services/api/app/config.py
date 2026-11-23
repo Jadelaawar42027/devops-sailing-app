@@ -30,6 +30,9 @@ class Settings:
     db_connect_retries: int = 20
     db_retry_delay_s: float = 5.0
     run_migrations: bool = True
+    forecast_url: str = "http://localhost:8011"
+    forecast_timeout_s: float = 10.0
+    forecast_days: int = 3
 
 
 def database_url_from_env() -> str | URL:
@@ -64,4 +67,7 @@ def load_settings() -> Settings:
         db_create_if_missing=_bool(os.getenv("DB_CREATE_IF_MISSING")),
         db_connect_retries=int(os.getenv("DB_CONNECT_RETRIES", "20")),
         db_retry_delay_s=float(os.getenv("DB_RETRY_DELAY_S", "5")),
+        forecast_url=os.getenv("FORECAST_URL", "http://localhost:8011"),
+        forecast_timeout_s=float(os.getenv("FORECAST_TIMEOUT_S", "10")),
+        forecast_days=int(os.getenv("FORECAST_DAYS", "3")),
     )
