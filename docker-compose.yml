@@ -1,0 +1,17 @@
+# Local run: docker compose up --build
+services:
+  api:
+    build: ./services/api
+    ports:
+      - "8010:8000"
+    environment:
+      CORS_ORIGINS: http://localhost:8090
+      LOG_LEVEL: INFO
+
+  forecast:
+    build: ./services/forecast
+    ports:
+      - "8011:8000"
+    environment:
+      CORS_ORIGINS: http://localhost:8090
+      LOG_LEVEL: INFO
